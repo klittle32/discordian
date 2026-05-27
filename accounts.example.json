@@ -1,0 +1,17 @@
+{
+  "accounts": [
+    {
+      "channel": "discordian",
+      "accountId": "main",
+      "displayName": "Discordian",
+      "enabled": true,
+      "dmPolicy": "pairing",
+      "allowedUsers": [],
+      "config": {
+        "webhookUrl": "http://127.0.0.1:8787/messages"
+      },
+      "createdAt": "2026-01-01T00:00:00.000Z",
+      "updatedAt": "2026-01-01T00:00:00.000Z"
+    }
+  ]
+}

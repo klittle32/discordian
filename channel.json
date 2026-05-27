@@ -1,0 +1,7 @@
+{
+  "id": "discordian",
+  "displayName": "Discordian",
+  "entry": "./plugin.mjs",
+  "runtimePackages": [],
+  "runtimeModules": []
+}

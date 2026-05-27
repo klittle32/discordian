@@ -1,0 +1,25 @@
+# Local Letta runtime metadata
+.letta/
+
+# Custom channel runtime dependencies and generated routing state
+runtime/
+routing.yaml
+pairing.yaml
+accounts.json
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Node / package manager artifacts
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# OS / editor noise
+.DS_Store
+.vscode/
+.idea/
