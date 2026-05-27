@@ -2,6 +2,10 @@
   "id": "discordian",
   "displayName": "Discordian",
   "entry": "./plugin.mjs",
-  "runtimePackages": [],
-  "runtimeModules": []
+  "runtimePackages": [
+    "discord.js@14.18.0"
+  ],
+  "runtimeModules": [
+    "discord.js"
+  ]
 }
