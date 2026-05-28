@@ -1019,3 +1019,250 @@ Implementation notes to investigate:
 - Ensure route creation remains idempotent under duplicate Discord events or listener restarts.
 - Preserve existing routes and their conversation ids; do not migrate old routes automatically without an explicit migration decision.
 - Decide how to handle conversation-creation failure: likely send a visible error to the originating Discord surface and avoid creating a broken route.
+
+### Detailed implementation plan: per-chat Letta conversation routing
+
+This is the implementation plan for the intended routing behavior above. Treat this as the working checklist for the next coding session.
+
+#### Current code to change
+
+The current route creation helpers are in `adapter.ts`:
+
+- `ensureDiscordianChannelRoute(channelId)`
+- `ensureDiscordianThreadRoute(parentChannelId, threadId)`
+
+Both helpers currently create route records by reusing an existing/default conversation id:
+
+- channel routes use `config.conversationId ?? process.env.LETTA_CONVERSATION_ID ?? "default"`;
+- thread routes use `parentRoute?.conversationId ?? config.conversationId ?? process.env.LETTA_CONVERSATION_ID ?? "default"`.
+
+That fallback behavior is now explicitly wrong for new Discord chat surfaces. New channel/thread routes must create fresh Letta conversations.
+
+The message path that calls these helpers is also in `adapter.ts`:
+
+- top-level `conversation: "thread"` message creates a Discord thread, then calls `ensureDiscordianThreadRoute(...)` before emitting inbound;
+- top-level `conversation: "channel"` message calls `ensureDiscordianChannelRoute(...)` before emitting inbound;
+- existing Discord thread message calls `ensureDiscordianThreadRoute(...)` before emitting inbound.
+
+That ordering is good: the route must exist before inbound delivery so the generic custom-channel registry can resolve the correct Letta conversation for the very first delivered message.
+
+#### Conversation creation API path
+
+Use the Letta conversations API to create a conversation for the configured agent before writing a new route.
+
+The installed `@letta-ai/letta-client` exposes:
+
+```ts
+client.conversations.create({
+  agent_id: config.agentId,
+  // optional body fields:
+  summary?: string,
+  hidden?: boolean,
+  context_window_limit?: number,
+  model?: string,
+  model_settings?: object,
+});
+```
+
+Under the hood this calls:
+
+```text
+POST /v1/conversations/?agent_id=<agent-id>
+```
+
+The response contains `conversation.id`.
+
+Implementation options to evaluate in order:
+
+1. Prefer importing `@letta-ai/letta-client` directly from the plugin if this works in the custom-channel runtime.
+2. If importing the client is too brittle for a plugin, use `fetch` against `LETTA_BASE_URL` with `Authorization: Bearer $LETTA_API_KEY`.
+3. If neither environment variable is reliably present inside custom-channel listeners, add an explicit Discordian config setting for Letta API base URL/key or expose a first-party channel-runtime helper in Letta Code.
+
+Do not shell out to `letta --new`; it creates/resumes CLI sessions and is not an appropriate adapter runtime API.
+
+#### New helper design
+
+Add a helper near the route helpers:
+
+```ts
+async function createDiscordianConversationRouteTarget(input: {
+  agentId: string;
+  chatKind: "channel" | "thread";
+  discordChatId: string;
+  parentChannelId?: string | null;
+  displayName?: string | null;
+}): Promise<string>
+```
+
+Responsibilities:
+
+1. Create a fresh Letta conversation for `input.agentId`.
+2. Return only the new `conversation.id`.
+3. Add a concise `summary` if useful for UI discovery, e.g.
+   - `Discordian channel 150...`
+   - `Discordian thread 150... in channel 150...`
+4. Do not send any seed messages.
+5. Throw on failure so route creation can fail visibly rather than persisting a broken route.
+
+Keep this helper narrow: route lookup/writes should stay in the route helpers.
+
+#### Route helper behavior after change
+
+`ensureDiscordianChannelRoute(channelId)`:
+
+1. Return existing enabled exact channel route unchanged when found.
+2. If no route exists and `config.agentId` is missing, return without creating anything, preserving current behavior.
+3. Create a fresh Letta conversation for `config.agentId`.
+4. Persist a route:
+
+```json
+{
+  "accountId": config.accountId,
+  "chatId": channelId,
+  "chatType": "channel",
+  "threadId": null,
+  "agentId": config.agentId,
+  "conversationId": "<new conv id>",
+  "enabled": true,
+  "createdAt": now,
+  "updatedAt": now
+}
+```
+
+5. Log `[Discordian] Created channel route` including `conversationId`.
+
+`ensureDiscordianThreadRoute(parentChannelId, threadId)`:
+
+1. Return existing enabled exact thread route unchanged when found.
+2. If no route exists and `config.agentId` is missing, return without creating anything, preserving current behavior.
+3. Handle incomplete route migration carefully:
+   - If an enabled route exists with `chatId === threadId` and missing `threadId`, migrate it by setting `threadId = threadId` and updating metadata.
+   - Preserve its existing `conversationId`; do not create a new conversation during migration because this route already existed and may have history.
+4. If no exact/incomplete route exists, create a fresh Letta conversation for `config.agentId`.
+5. Persist a route:
+
+```json
+{
+  "accountId": config.accountId,
+  "chatId": threadId,
+  "chatType": "channel",
+  "threadId": threadId,
+  "agentId": config.agentId,
+  "conversationId": "<new conv id>",
+  "enabled": true,
+  "createdAt": now,
+  "updatedAt": now
+}
+```
+
+6. Do not inherit `conversationId` from the parent channel route.
+7. Do not fall back to `config.conversationId`, `LETTA_CONVERSATION_ID`, or `"default"`.
+8. Log `[Discordian] Created thread route` including `conversationId`.
+
+#### Idempotency and race handling
+
+The current read/modify/write routing file approach can race if duplicate Discord events arrive concurrently. This feature makes races more expensive because a duplicate route race could create multiple Letta conversations.
+
+Implement at least process-local serialization around route creation:
+
+- Add a `Map<string, Promise<void>>` or queue keyed by route identity:
+  - channel key: `${accountId}:channel:${channelId}`
+  - thread key: `${accountId}:thread:${threadId}`
+- `ensureDiscordianChannelRoute` and `ensureDiscordianThreadRoute` should run their read/create/write critical section through that key.
+- Inside the lock, re-read `routing.yaml` and re-check for existing route before creating the Letta conversation.
+- Only create the conversation after the second in-lock route existence check.
+
+Optional hardening after the first pass:
+
+- write `routing.yaml` via temp file + rename instead of direct write;
+- consider file locks if multiple listener processes are expected.
+
+#### Failure behavior
+
+If conversation creation fails:
+
+- Do not write a route with `conversationId: "default"`.
+- Do not write a route with missing/null `conversationId`.
+- Let the error propagate to the existing delivery-error path so the Discord user sees a useful failure message.
+- Log a clear adapter error with account id, chat id, thread id, and agent id, but never log API keys.
+
+If route write fails after conversation creation:
+
+- Log the failure clearly.
+- Let the inbound delivery fail rather than routing to the wrong conversation.
+- Accept that an orphan Letta conversation may have been created; avoiding wrong routing is more important than avoiding occasional orphan conversations.
+
+#### First-message semantics
+
+Do not add any separate seed/history injection.
+
+The first inbound message that caused route creation should be delivered normally after the route exists:
+
+- top-level channel first accepted message -> first user message in the new channel conversation;
+- auto-threaded original message -> first user message in the new thread conversation;
+- manually-created thread starter/reply -> first user message in the new thread conversation;
+- Needle-routed wrapper -> first user message in the new thread conversation.
+
+Do not call `resolveDiscordThreadHistory(...)` or `resolveDiscordThreadStarter(...)` for seeding as part of this feature. Existing attachment/starter helpers should only remain where they are already used for message formatting/media, not for creating additional conversation history.
+
+#### Config/documentation changes
+
+Update docs after implementation:
+
+- README: clarify that `config.conversation_id` / pair-time conversation id is bootstrap/default only and new Discord chat surfaces create their own conversations.
+- README: explain route identity: channel id maps to one conversation; thread id maps to one conversation.
+- `docs/IMPLEMENTATION_NOTES.md`: replace old short-term fallback notes with the per-chat conversation behavior.
+- `accounts.example.json`: probably no config change needed unless a new API credential field is required.
+
+Avoid introducing a compatibility config flag unless live testing shows a real need. The intended public behavior is per-chat conversation isolation.
+
+#### Build and local validation
+
+After implementation:
+
+1. Rebuild bundled output (`plugin.mjs`) with the repo's build command.
+2. Run syntax checks:
+   - `node --check plugin.mjs`
+   - any TypeScript/build checks already used by the repo
+   - `git diff --check`
+3. Validate example JSON if touched.
+4. Inspect diff for any remaining `conversationId` fallback to `config.conversationId`, `LETTA_CONVERSATION_ID`, or `"default"` in new route creation paths.
+
+#### Live test matrix
+
+Use a fresh or edited live `routing.yaml` so tests actually exercise route creation.
+
+Test cases:
+
+1. Top-level channel with `conversation: "channel"` and no existing route:
+   - send accepted message;
+   - verify new channel route created;
+   - verify route has new `conversationId`, not `conv-6446c2cb-e883-4502-ad55-423b88f1c9e0` and not `default`;
+   - send second message in same channel;
+   - verify same route/conversation reused.
+2. Top-level channel with `conversation: "thread"` and no existing thread route:
+   - send accepted message;
+   - verify Discord thread created;
+   - verify new thread route created with fresh `conversationId`;
+   - verify first delivered message appears in that thread conversation.
+3. Manually-created Discord thread under a `conversation: "channel"` parent:
+   - send message in manual thread;
+   - verify new thread route created with fresh `conversationId`;
+   - verify no parent/default conversation inheritance.
+4. Needle/external thread:
+   - trigger Needle-routed message;
+   - verify new thread route created with fresh `conversationId`;
+   - verify wrapper is the first conversation message.
+5. Existing route preservation:
+   - send again to a route created before the test;
+   - verify existing `conversationId` is reused and not migrated automatically.
+6. Duplicate/idempotency smoke:
+   - send/replay near-simultaneous duplicate event if practical;
+   - verify only one route exists for the Discord chat id.
+
+Useful log checks:
+
+- `[Discordian] Created channel route ... conversationId=conv-...`
+- `[Discordian] Created thread route ... conversationId=conv-...`
+- no `conversationId: "default"` in newly-created routes;
+- no accidental parent conversation inheritance for threads.
