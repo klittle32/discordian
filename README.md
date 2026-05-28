@@ -108,6 +108,18 @@ For `conversation: "channel"`, Discordian creates a dedicated Letta conversation
 
 Fresh route creation requires Letta API credentials inside the listener process. Prefer `DISCORDIAN_LETTA_API_KEY` for deployment; for quick local testing, set nested `config.discordian_letta_api_key` in the Discordian account. The example config omits this optional secret so accidental copy/paste does not put API keys in JSON. The account key name is intentionally Discordian-specific because it is only for Discordian's public-API route creation workaround. Discordian uses Letta Code's `LETTA_BASE_URL` environment when present and otherwise defaults to `https://api.letta.com`; there is intentionally no per-account base URL override to avoid creating routes against a different backend than the running listener.
 
+Discordian sends Discord native typing indicators while accepted turns are processing. Typing is enabled by default and targets the same Discord surface as replies (`threadId ?? chatId`). Discord's API is pulse-based: Discordian calls `sendTyping()` immediately, refreshes it while the turn is active, then clears its refresh timer so the last pulse expires naturally. Optional account config fields are:
+
+```json
+{
+  "typing_indicator": true,
+  "typing_indicator_refresh_ms": 8000,
+  "typing_indicator_max_ms": 600000
+}
+```
+
+CamelCase aliases are also accepted: `typingIndicator`, `typingIndicatorRefreshMs`, and `typingIndicatorMaxMs`.
+
 ## Development notes
 
 Build the bundled plugin after source changes:

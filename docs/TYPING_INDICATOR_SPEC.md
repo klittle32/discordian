@@ -2,7 +2,7 @@
 
 ## Status
 
-Planned.
+Implemented in Discordian.
 
 ## Goal
 

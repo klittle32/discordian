@@ -71,6 +71,7 @@ interface DiscordChannelLike {
   isTextBased?: () => boolean;
   isThread?: () => boolean;
   send?: (options: string | Record<string, unknown>) => Promise<{ id: string }>;
+  sendTyping?: () => Promise<unknown>;
   messages?: {
     fetch: (id: string) => Promise<DiscordFetchedMessageLike>;
   };
@@ -201,6 +202,23 @@ const INGRESS_DEDUPE_MAX = 2_000;
 const LIFECYCLE_STATE_TTL_MS = 6 * 60 * 60 * 1000;
 const LIFECYCLE_STATE_MAX = 2_000;
 const DISCORD_LIFECYCLE_ERROR_TEXT_MAX = 1500;
+const THREAD_STARTER_REFETCH_DELAY_MS = 750;
+const DISCORD_TYPING_INDICATOR_DEFAULT = true;
+const DISCORD_TYPING_REFRESH_MS_DEFAULT = 8_000;
+const DISCORD_TYPING_REFRESH_MS_MIN = 3_000;
+const DISCORD_TYPING_REFRESH_MS_MAX = 30_000;
+const DISCORD_TYPING_MAX_MS_DEFAULT = 10 * 60 * 1000;
+const DISCORD_TYPING_MAX_MS_MIN = 30_000;
+const DISCORD_TYPING_MAX_MS_MAX = 60 * 60 * 1000;
+
+type DiscordTypingTargetId = string;
+type DiscordTypingSourceKey = string;
+
+interface DiscordTypingState {
+  sourceKeys: Set<DiscordTypingSourceKey>;
+  timer: ReturnType<typeof setInterval>;
+  timeout: ReturnType<typeof setTimeout>;
+}
 
 function formatChannelLifecycleErrorMessage(errorText: string, options: { codeBlock?: boolean; maxLength?: number } = {}): string {
   const maxLength = options.maxLength ?? 1500;
@@ -248,6 +266,39 @@ function isDiscordSendableChannel(
   send: (options: string | Record<string, unknown>) => Promise<{ id: string }>;
 } {
   return isDiscordTextChannel(channel) && typeof channel.send === "function";
+}
+
+function isDiscordTypingChannel(
+  channel: DiscordChannelLike | null,
+): channel is DiscordChannelLike & {
+  sendTyping: () => Promise<unknown>;
+} {
+  return isDiscordTextChannel(channel) && typeof channel.sendTyping === "function";
+}
+
+function clampNumber(value: number, min: number, max: number): number {
+  return Math.min(Math.max(value, min), max);
+}
+
+function resolveBooleanConfig(value: unknown, fallback: boolean): boolean {
+  return typeof value === "boolean" ? value : fallback;
+}
+
+function resolveMillisecondsConfig(
+  value: unknown,
+  fallback: number,
+  min: number,
+  max: number,
+): number {
+  const numeric = typeof value === "number"
+    ? value
+    : typeof value === "string" && value.trim().length > 0
+      ? Number(value)
+      : NaN;
+  if (!Number.isFinite(numeric) || numeric <= 0) {
+    return fallback;
+  }
+  return clampNumber(Math.round(numeric), min, max);
 }
 
 function splitMessageText(text: string, maxLength: number): string[] {
@@ -401,6 +452,23 @@ export function createDiscordAdapter(
   const lifecycleOperationByMessageKey = new Map<string, Promise<void>>();
   const lifecycleErrorReplyKeys = new Map<string, number>();
   const discordianRouteLocks = new Map<DiscordianRouteLockKey, Promise<void>>();
+  const typingByChatId = new Map<DiscordTypingTargetId, DiscordTypingState>();
+  const typingIndicatorEnabled = resolveBooleanConfig(
+    config.typingIndicator ?? config.typing_indicator,
+    DISCORD_TYPING_INDICATOR_DEFAULT,
+  );
+  const typingRefreshMs = resolveMillisecondsConfig(
+    config.typingIndicatorRefreshMs ?? config.typing_indicator_refresh_ms,
+    DISCORD_TYPING_REFRESH_MS_DEFAULT,
+    DISCORD_TYPING_REFRESH_MS_MIN,
+    DISCORD_TYPING_REFRESH_MS_MAX,
+  );
+  const typingMaxMs = resolveMillisecondsConfig(
+    config.typingIndicatorMaxMs ?? config.typing_indicator_max_ms,
+    DISCORD_TYPING_MAX_MS_DEFAULT,
+    DISCORD_TYPING_MAX_MS_MIN,
+    DISCORD_TYPING_MAX_MS_MAX,
+  );
 
   function pruneSeenIngressMessageKeys(now: number = Date.now()): void {
     for (const [key, expiresAt] of seenIngressMessageKeys) {
@@ -495,6 +563,97 @@ export function createDiscordAdapter(
       source.threadId ?? source.messageId ?? "",
       source.conversationId,
     ].join(":");
+  }
+
+  function getTypingTargetId(source): string | null {
+    if (source.channel !== CHANNEL_ID) return null;
+    const targetId = source.threadId ?? source.chatId;
+    return isNonEmptyString(targetId) ? targetId : null;
+  }
+
+  function getTypingSourceKey(source): DiscordTypingSourceKey | null {
+    const targetId = getTypingTargetId(source);
+    if (!targetId) return null;
+    return [
+      source.accountId ?? "",
+      source.channel ?? "",
+      source.chatId ?? "",
+      source.threadId ?? "",
+      source.messageId ?? "",
+      source.agentId ?? "",
+      source.conversationId ?? "",
+    ].join(":");
+  }
+
+  async function sendTypingAction(targetChannelId: string): Promise<void> {
+    if (!running || !client) return;
+    try {
+      const channel = await client.channels.fetch(targetChannelId);
+      if (!isDiscordTypingChannel(channel)) return;
+      await channel.sendTyping();
+    } catch (error) {
+      console.warn(
+        `[Discord] Failed to send typing indicator for ${targetChannelId}:`,
+        error instanceof Error ? error.message : error,
+      );
+    }
+  }
+
+  function clearTypingForChat(targetChannelId: string): void {
+    const entry = typingByChatId.get(targetChannelId);
+    if (!entry) return;
+    clearInterval(entry.timer);
+    clearTimeout(entry.timeout);
+    typingByChatId.delete(targetChannelId);
+  }
+
+  function clearAllTyping(): void {
+    for (const entry of typingByChatId.values()) {
+      clearInterval(entry.timer);
+      clearTimeout(entry.timeout);
+    }
+    typingByChatId.clear();
+  }
+
+  function startTypingForSource(source): void {
+    if (!typingIndicatorEnabled) return;
+    const targetId = getTypingTargetId(source);
+    const sourceKey = getTypingSourceKey(source);
+    if (!targetId || !sourceKey) return;
+
+    const existing = typingByChatId.get(targetId);
+    if (existing) {
+      existing.sourceKeys.add(sourceKey);
+      return;
+    }
+
+    void sendTypingAction(targetId);
+    const timer = setInterval(() => {
+      void sendTypingAction(targetId);
+    }, typingRefreshMs);
+    const timeout = setTimeout(() => {
+      clearTypingForChat(targetId);
+    }, typingMaxMs);
+    timer.unref?.();
+    timeout.unref?.();
+
+    typingByChatId.set(targetId, {
+      sourceKeys: new Set([sourceKey]),
+      timer,
+      timeout,
+    });
+  }
+
+  function stopTypingForSource(source): void {
+    const targetId = getTypingTargetId(source);
+    const sourceKey = getTypingSourceKey(source);
+    if (!targetId || !sourceKey) return;
+    const entry = typingByChatId.get(targetId);
+    if (!entry) return;
+    entry.sourceKeys.delete(sourceKey);
+    if (entry.sourceKeys.size === 0) {
+      clearTypingForChat(targetId);
+    }
   }
 
   function pruneLifecycleState(now: number = Date.now()): void {
@@ -1194,6 +1353,15 @@ export function createDiscordAdapter(
           effectiveChatId = createdThread.id;
           effectiveThreadId = createdThread.id;
           await ensureDiscordianThreadRoute(message.channelId, createdThread.id);
+          console.log(
+            "[Discordian] Moved top-level message into thread route",
+            JSON.stringify({
+              accountId: config.accountId,
+              parentChannelId: message.channelId,
+              messageId: message.id,
+              threadId: createdThread.id,
+            }),
+          );
         } else if (!isThread && channelPolicy.conversation === "channel") {
           await ensureDiscordianChannelRoute(message.channelId);
         } else if (isThread && effectiveThreadId) {
@@ -1374,6 +1542,7 @@ export function createDiscordAdapter(
       lifecycleStateByMessageKey.clear();
       lifecycleOperationByMessageKey.clear();
       lifecycleErrorReplyKeys.clear();
+      clearAllTyping();
       console.log("[Discord] Bot stopped");
     },
 
@@ -1389,7 +1558,15 @@ export function createDiscordAdapter(
         await scheduleLifecycleTransition(event.source, "queued");
         return;
       }
-      if (event.type === "processing") return;
+      if (event.type === "processing") {
+        for (const source of event.sources) {
+          startTypingForSource(source);
+        }
+        return;
+      }
+      for (const source of event.sources) {
+        stopTypingForSource(source);
+      }
       const nextState: LifecycleState =
         event.outcome === "completed"
           ? "completed"
@@ -1439,6 +1616,7 @@ export function createDiscordAdapter(
         }
         const emoji = resolveDiscordReactionEmoji(msg.reaction);
         const targetChannelId = msg.threadId ?? msg.chatId;
+        clearTypingForChat(targetChannelId);
         const channel = await client.channels.fetch(targetChannelId);
         if (!hasDiscordMessageFetcher(channel)) {
           throw new Error(
@@ -1470,6 +1648,7 @@ export function createDiscordAdapter(
           msg.replyToMessageId,
           targetChannelId,
         );
+        clearTypingForChat(targetChannelId);
         const result = await channel.send({
           content: msg.text?.trim() || undefined,
           ...(reply ?? {}),
@@ -1495,6 +1674,7 @@ export function createDiscordAdapter(
         msg.replyToMessageId,
         targetChannelId,
       );
+      clearTypingForChat(targetChannelId);
       const chunks = splitMessageText(msg.text, DISCORD_SPLIT_THRESHOLD);
       let lastMessageId = "";
       for (const chunk of chunks) {

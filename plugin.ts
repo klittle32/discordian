@@ -2,6 +2,56 @@ import { createDiscordAdapter } from "./adapter";
 import { discordianMessageActions } from "./message-actions";
 import { CHANNEL_ID, DISPLAY_NAME } from "./runtime.mjs";
 
+
+const DISCORD_TYPING_INDICATOR_DEFAULT = true;
+const DISCORD_TYPING_REFRESH_MS_DEFAULT = 8_000;
+const DISCORD_TYPING_REFRESH_MS_MIN = 3_000;
+const DISCORD_TYPING_REFRESH_MS_MAX = 30_000;
+const DISCORD_TYPING_MAX_MS_DEFAULT = 10 * 60 * 1000;
+const DISCORD_TYPING_MAX_MS_MIN = 30_000;
+const DISCORD_TYPING_MAX_MS_MAX = 60 * 60 * 1000;
+
+function clampNumber(value, min, max) {
+  return Math.min(Math.max(value, min), max);
+}
+
+function resolveBooleanConfig(value, fallback) {
+  return typeof value === "boolean" ? value : fallback;
+}
+
+function resolveMillisecondsConfig(value, fallback, min, max) {
+  const numeric = typeof value === "number"
+    ? value
+    : typeof value === "string" && value.trim().length > 0
+      ? Number(value)
+      : NaN;
+  if (!Number.isFinite(numeric) || numeric <= 0) {
+    return fallback;
+  }
+  return clampNumber(Math.round(numeric), min, max);
+}
+
+function resolveTypingLogConfig(normalized) {
+  return {
+    typingIndicator: resolveBooleanConfig(
+      normalized.typingIndicator,
+      DISCORD_TYPING_INDICATOR_DEFAULT,
+    ),
+    typingIndicatorRefreshMs: resolveMillisecondsConfig(
+      normalized.typingIndicatorRefreshMs,
+      DISCORD_TYPING_REFRESH_MS_DEFAULT,
+      DISCORD_TYPING_REFRESH_MS_MIN,
+      DISCORD_TYPING_REFRESH_MS_MAX,
+    ),
+    typingIndicatorMaxMs: resolveMillisecondsConfig(
+      normalized.typingIndicatorMaxMs,
+      DISCORD_TYPING_MAX_MS_DEFAULT,
+      DISCORD_TYPING_MAX_MS_MIN,
+      DISCORD_TYPING_MAX_MS_MAX,
+    ),
+  };
+}
+
 function readTopLevel(account, key, fallback = undefined) {
   if (account && Object.prototype.hasOwnProperty.call(account, key)) {
     return account[key];
@@ -99,6 +149,21 @@ function normalizeAccount(account) {
       "allowedBotIds",
       readConfig(account, "allowed_bot_ids", []),
     ),
+    typingIndicator: readConfig(
+      account,
+      "typingIndicator",
+      readConfig(account, "typing_indicator", undefined),
+    ),
+    typingIndicatorRefreshMs: readConfig(
+      account,
+      "typingIndicatorRefreshMs",
+      readConfig(account, "typing_indicator_refresh_ms", undefined),
+    ),
+    typingIndicatorMaxMs: readConfig(
+      account,
+      "typingIndicatorMaxMs",
+      readConfig(account, "typing_indicator_max_ms", undefined),
+    ),
   };
 }
 
@@ -113,6 +178,7 @@ export const channelPlugin = {
   createAdapter(account) {
     const normalized = normalizeAccount(account);
     const baseUrl = (process.env.LETTA_BASE_URL || "https://api.letta.com").replace(/\/+$/, "");
+    const typingLogConfig = resolveTypingLogConfig(normalized);
     console.log(
       "[Discordian] Loaded plugin",
       JSON.stringify({
@@ -121,6 +187,7 @@ export const channelPlugin = {
         agentConfigured: typeof normalized.agentId === "string" && normalized.agentId.length > 0,
         credentialSource: resolveDiscordianCredentialSource(account),
         baseUrl,
+        ...typingLogConfig,
       }),
     );
 

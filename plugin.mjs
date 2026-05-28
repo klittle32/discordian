@@ -285,6 +285,14 @@ var INGRESS_DEDUPE_MAX = 2000;
 var LIFECYCLE_STATE_TTL_MS = 6 * 60 * 60 * 1000;
 var LIFECYCLE_STATE_MAX = 2000;
 var DISCORD_LIFECYCLE_ERROR_TEXT_MAX = 1500;
+var THREAD_STARTER_REFETCH_DELAY_MS = 750;
+var DISCORD_TYPING_INDICATOR_DEFAULT = true;
+var DISCORD_TYPING_REFRESH_MS_DEFAULT = 8000;
+var DISCORD_TYPING_REFRESH_MS_MIN = 3000;
+var DISCORD_TYPING_REFRESH_MS_MAX = 30000;
+var DISCORD_TYPING_MAX_MS_DEFAULT = 10 * 60 * 1000;
+var DISCORD_TYPING_MAX_MS_MIN = 30000;
+var DISCORD_TYPING_MAX_MS_MAX = 60 * 60 * 1000;
 function formatChannelLifecycleErrorMessage(errorText, options = {}) {
   const maxLength = options.maxLength ?? 1500;
   const normalized = String(errorText ?? "").trim() || "Unknown error";
@@ -307,6 +315,22 @@ function hasDiscordMessageFetcher(channel) {
 }
 function isDiscordSendableChannel(channel) {
   return isDiscordTextChannel(channel) && typeof channel.send === "function";
+}
+function isDiscordTypingChannel(channel) {
+  return isDiscordTextChannel(channel) && typeof channel.sendTyping === "function";
+}
+function clampNumber(value, min, max) {
+  return Math.min(Math.max(value, min), max);
+}
+function resolveBooleanConfig(value, fallback) {
+  return typeof value === "boolean" ? value : fallback;
+}
+function resolveMillisecondsConfig(value, fallback, min, max) {
+  const numeric = typeof value === "number" ? value : typeof value === "string" && value.trim().length > 0 ? Number(value) : NaN;
+  if (!Number.isFinite(numeric) || numeric <= 0) {
+    return fallback;
+  }
+  return clampNumber(Math.round(numeric), min, max);
 }
 function splitMessageText(text, maxLength) {
   if (text.length <= maxLength) {
@@ -400,6 +424,10 @@ function createDiscordAdapter(config) {
   const lifecycleOperationByMessageKey = new Map;
   const lifecycleErrorReplyKeys = new Map;
   const discordianRouteLocks = new Map;
+  const typingByChatId = new Map;
+  const typingIndicatorEnabled = resolveBooleanConfig(config.typingIndicator ?? config.typing_indicator, DISCORD_TYPING_INDICATOR_DEFAULT);
+  const typingRefreshMs = resolveMillisecondsConfig(config.typingIndicatorRefreshMs ?? config.typing_indicator_refresh_ms, DISCORD_TYPING_REFRESH_MS_DEFAULT, DISCORD_TYPING_REFRESH_MS_MIN, DISCORD_TYPING_REFRESH_MS_MAX);
+  const typingMaxMs = resolveMillisecondsConfig(config.typingIndicatorMaxMs ?? config.typing_indicator_max_ms, DISCORD_TYPING_MAX_MS_DEFAULT, DISCORD_TYPING_MAX_MS_MIN, DISCORD_TYPING_MAX_MS_MAX);
   function pruneSeenIngressMessageKeys(now = Date.now()) {
     for (const [key, expiresAt] of seenIngressMessageKeys) {
       if (expiresAt <= now) {
@@ -475,6 +503,93 @@ function createDiscordAdapter(config) {
       source.threadId ?? source.messageId ?? "",
       source.conversationId
     ].join(":");
+  }
+  function getTypingTargetId(source) {
+    if (source.channel !== CHANNEL_ID)
+      return null;
+    const targetId = source.threadId ?? source.chatId;
+    return isNonEmptyString(targetId) ? targetId : null;
+  }
+  function getTypingSourceKey(source) {
+    const targetId = getTypingTargetId(source);
+    if (!targetId)
+      return null;
+    return [
+      source.accountId ?? "",
+      source.channel ?? "",
+      source.chatId ?? "",
+      source.threadId ?? "",
+      source.messageId ?? "",
+      source.agentId ?? "",
+      source.conversationId ?? ""
+    ].join(":");
+  }
+  async function sendTypingAction(targetChannelId) {
+    if (!running || !client)
+      return;
+    try {
+      const channel = await client.channels.fetch(targetChannelId);
+      if (!isDiscordTypingChannel(channel))
+        return;
+      await channel.sendTyping();
+    } catch (error) {
+      console.warn(`[Discord] Failed to send typing indicator for ${targetChannelId}:`, error instanceof Error ? error.message : error);
+    }
+  }
+  function clearTypingForChat(targetChannelId) {
+    const entry = typingByChatId.get(targetChannelId);
+    if (!entry)
+      return;
+    clearInterval(entry.timer);
+    clearTimeout(entry.timeout);
+    typingByChatId.delete(targetChannelId);
+  }
+  function clearAllTyping() {
+    for (const entry of typingByChatId.values()) {
+      clearInterval(entry.timer);
+      clearTimeout(entry.timeout);
+    }
+    typingByChatId.clear();
+  }
+  function startTypingForSource(source) {
+    if (!typingIndicatorEnabled)
+      return;
+    const targetId = getTypingTargetId(source);
+    const sourceKey = getTypingSourceKey(source);
+    if (!targetId || !sourceKey)
+      return;
+    const existing = typingByChatId.get(targetId);
+    if (existing) {
+      existing.sourceKeys.add(sourceKey);
+      return;
+    }
+    sendTypingAction(targetId);
+    const timer = setInterval(() => {
+      sendTypingAction(targetId);
+    }, typingRefreshMs);
+    const timeout = setTimeout(() => {
+      clearTypingForChat(targetId);
+    }, typingMaxMs);
+    timer.unref?.();
+    timeout.unref?.();
+    typingByChatId.set(targetId, {
+      sourceKeys: new Set([sourceKey]),
+      timer,
+      timeout
+    });
+  }
+  function stopTypingForSource(source) {
+    const targetId = getTypingTargetId(source);
+    const sourceKey = getTypingSourceKey(source);
+    if (!targetId || !sourceKey)
+      return;
+    const entry = typingByChatId.get(targetId);
+    if (!entry)
+      return;
+    entry.sourceKeys.delete(sourceKey);
+    if (entry.sourceKeys.size === 0) {
+      clearTypingForChat(targetId);
+    }
   }
   function pruneLifecycleState(now = Date.now()) {
     for (const [key, entry] of lifecycleStateByMessageKey) {
@@ -974,6 +1089,12 @@ function createDiscordAdapter(config) {
           effectiveChatId = createdThread.id;
           effectiveThreadId = createdThread.id;
           await ensureDiscordianThreadRoute(message.channelId, createdThread.id);
+          console.log("[Discordian] Moved top-level message into thread route", JSON.stringify({
+            accountId: config.accountId,
+            parentChannelId: message.channelId,
+            messageId: message.id,
+            threadId: createdThread.id
+          }));
         } else if (!isThread && channelPolicy.conversation === "channel") {
           await ensureDiscordianChannelRoute(message.channelId);
         } else if (isThread && effectiveThreadId) {
@@ -1109,6 +1230,7 @@ function createDiscordAdapter(config) {
       lifecycleStateByMessageKey.clear();
       lifecycleOperationByMessageKey.clear();
       lifecycleErrorReplyKeys.clear();
+      clearAllTyping();
       console.log("[Discord] Bot stopped");
     },
     isRunning() {
@@ -1121,8 +1243,15 @@ function createDiscordAdapter(config) {
         await scheduleLifecycleTransition(event.source, "queued");
         return;
       }
-      if (event.type === "processing")
+      if (event.type === "processing") {
+        for (const source of event.sources) {
+          startTypingForSource(source);
+        }
         return;
+      }
+      for (const source of event.sources) {
+        stopTypingForSource(source);
+      }
       const nextState = event.outcome === "completed" ? "completed" : event.outcome === "cancelled" ? "cancelled" : "error";
       await Promise.all(event.sources.map((source) => scheduleLifecycleTransition(source, nextState)));
       const errorText = event.outcome === "error" ? event.error?.trim() : null;
@@ -1153,6 +1282,7 @@ function createDiscordAdapter(config) {
         }
         const emoji = resolveDiscordReactionEmoji(msg.reaction);
         const targetChannelId2 = msg.threadId ?? msg.chatId;
+        clearTypingForChat(targetChannelId2);
         const channel2 = await client.channels.fetch(targetChannelId2);
         if (!hasDiscordMessageFetcher(channel2)) {
           throw new Error(`Discord channel not found or not text-based: ${targetChannelId2}`);
@@ -1175,6 +1305,7 @@ function createDiscordAdapter(config) {
           throw new Error(`Discord channel not found or not text-based: ${targetChannelId2}`);
         }
         const reply2 = buildDiscordReplyOptions(msg.replyToMessageId, targetChannelId2);
+        clearTypingForChat(targetChannelId2);
         const result = await channel2.send({
           content: msg.text?.trim() || undefined,
           ...reply2 ?? {},
@@ -1193,6 +1324,7 @@ function createDiscordAdapter(config) {
         throw new Error(`Discord channel not found or not text-based: ${targetChannelId}`);
       }
       const reply = buildDiscordReplyOptions(msg.replyToMessageId, targetChannelId);
+      clearTypingForChat(targetChannelId);
       const chunks = splitMessageText(msg.text, DISCORD_SPLIT_THRESHOLD);
       let lastMessageId = "";
       for (const chunk of chunks) {
@@ -1291,6 +1423,33 @@ var discordianMessageActions = {
 };
 
 // plugin.ts
+var DISCORD_TYPING_INDICATOR_DEFAULT2 = true;
+var DISCORD_TYPING_REFRESH_MS_DEFAULT2 = 8000;
+var DISCORD_TYPING_REFRESH_MS_MIN2 = 3000;
+var DISCORD_TYPING_REFRESH_MS_MAX2 = 30000;
+var DISCORD_TYPING_MAX_MS_DEFAULT2 = 10 * 60 * 1000;
+var DISCORD_TYPING_MAX_MS_MIN2 = 30000;
+var DISCORD_TYPING_MAX_MS_MAX2 = 60 * 60 * 1000;
+function clampNumber2(value, min, max) {
+  return Math.min(Math.max(value, min), max);
+}
+function resolveBooleanConfig2(value, fallback) {
+  return typeof value === "boolean" ? value : fallback;
+}
+function resolveMillisecondsConfig2(value, fallback, min, max) {
+  const numeric = typeof value === "number" ? value : typeof value === "string" && value.trim().length > 0 ? Number(value) : NaN;
+  if (!Number.isFinite(numeric) || numeric <= 0) {
+    return fallback;
+  }
+  return clampNumber2(Math.round(numeric), min, max);
+}
+function resolveTypingLogConfig(normalized) {
+  return {
+    typingIndicator: resolveBooleanConfig2(normalized.typingIndicator, DISCORD_TYPING_INDICATOR_DEFAULT2),
+    typingIndicatorRefreshMs: resolveMillisecondsConfig2(normalized.typingIndicatorRefreshMs, DISCORD_TYPING_REFRESH_MS_DEFAULT2, DISCORD_TYPING_REFRESH_MS_MIN2, DISCORD_TYPING_REFRESH_MS_MAX2),
+    typingIndicatorMaxMs: resolveMillisecondsConfig2(normalized.typingIndicatorMaxMs, DISCORD_TYPING_MAX_MS_DEFAULT2, DISCORD_TYPING_MAX_MS_MIN2, DISCORD_TYPING_MAX_MS_MAX2)
+  };
+}
 function readTopLevel(account, key, fallback = undefined) {
   if (account && Object.prototype.hasOwnProperty.call(account, key)) {
     return account[key];
@@ -1344,7 +1503,10 @@ function normalizeAccount(account) {
     removeStaleRoutes: readConfig(account, "removeStaleRoutes", readConfig(account, "remove_stale_routes", false)),
     transcribeVoice: readConfig(account, "transcribeVoice", readConfig(account, "transcribe_voice", false)),
     respondToBots: readConfig(account, "respondToBots", readConfig(account, "respond_to_bots", false)) === true,
-    allowedBotIds: readConfig(account, "allowedBotIds", readConfig(account, "allowed_bot_ids", []))
+    allowedBotIds: readConfig(account, "allowedBotIds", readConfig(account, "allowed_bot_ids", [])),
+    typingIndicator: readConfig(account, "typingIndicator", readConfig(account, "typing_indicator", undefined)),
+    typingIndicatorRefreshMs: readConfig(account, "typingIndicatorRefreshMs", readConfig(account, "typing_indicator_refresh_ms", undefined)),
+    typingIndicatorMaxMs: readConfig(account, "typingIndicatorMaxMs", readConfig(account, "typing_indicator_max_ms", undefined))
   };
 }
 var channelPlugin = {
@@ -1357,12 +1519,14 @@ var channelPlugin = {
   createAdapter(account) {
     const normalized = normalizeAccount(account);
     const baseUrl = (process.env.LETTA_BASE_URL || "https://api.letta.com").replace(/\/+$/, "");
+    const typingLogConfig = resolveTypingLogConfig(normalized);
     console.log("[Discordian] Loaded plugin", JSON.stringify({
       build: "public-api-route-conversations",
       accountId: normalized.accountId,
       agentConfigured: typeof normalized.agentId === "string" && normalized.agentId.length > 0,
       credentialSource: resolveDiscordianCredentialSource(account),
-      baseUrl
+      baseUrl,
+      ...typingLogConfig
     }));
     account.dmPolicy = "open";
     account.allowedUsers = [];

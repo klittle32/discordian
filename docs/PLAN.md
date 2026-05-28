@@ -1687,6 +1687,10 @@ See `docs/TYPING_INDICATOR_SPEC.md` for the feature contract, Discord API behavi
 
 Add a Discord-native typing indicator while Discordian is processing an inbound Letta turn. The indicator should use Discord.js `sendTyping()` on the actual reply target (`threadId ?? chatId`), refresh during long turns, and stop by clearing Discordian's interval when the turn completes, errors, cancels, sends output, or the adapter stops.
 
+### Implementation status
+
+Source implementation is complete in `adapter.ts` / `plugin.ts`, `plugin.mjs` has been rebuilt, and static validation has passed. Live Discord validation remains pending.
+
 ### Implementation todo plan
 
 #### 1. Confirm current adapter lifecycle and typing insertion points

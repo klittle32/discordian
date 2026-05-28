@@ -376,3 +376,35 @@ Resolution rules:
 - Discordian's own bot user is always ignored globally and cannot be enabled by channel config.
 - Guild sender bot filtering happens after resolving effective channel config, so a Needle/integration channel can allow bot messages without allowing bots everywhere.
 - DM authorization continues to use account-level Discordian DM config.
+
+## Discord typing indicators
+
+Discordian now uses Discord's native pulse-based typing indicator while Letta is processing accepted inbound turns.
+
+Implementation notes:
+
+- Typing starts from `handleTurnLifecycleEvent({ type: "processing" })`, not from raw Discord message receipt.
+- The target Discord surface is `source.threadId ?? source.chatId`, matching outbound reply placement for channel and thread routes.
+- Discord.js exposes `sendTyping()` but no explicit modern stop API. Discordian sends an immediate pulse, refreshes on an interval, and stops by clearing the interval so the last pulse expires naturally.
+- Typing state is tracked per target channel/thread with active lifecycle source keys, so overlapping sources in the same target do not clear the indicator until all sources finish.
+- Terminal lifecycle outcomes (`completed`, `error`, `cancelled`) stop typing before lifecycle reaction/error reply work continues.
+- Outbound text and file sends clear typing for the target before sending the visible response.
+- Adapter shutdown clears all typing timers.
+- Typing failures are warning-only and do not fail message delivery or lifecycle error replies.
+
+Config defaults:
+
+```json
+{
+  "typing_indicator": true,
+  "typing_indicator_refresh_ms": 8000,
+  "typing_indicator_max_ms": 600000
+}
+```
+
+CamelCase aliases are also supported by plugin normalization: `typingIndicator`, `typingIndicatorRefreshMs`, and `typingIndicatorMaxMs`.
+
+Operational caveats:
+
+- The final Discord typing pulse may linger briefly after Discordian clears its interval because Discord expires typing indicators itself.
+- Duplicate listener processes can each send typing pulses, matching the existing duplicate inbound delivery caveat. Run only one listener per Discord bot/account during live testing.
