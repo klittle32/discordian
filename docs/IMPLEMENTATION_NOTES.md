@@ -36,7 +36,7 @@ bun build plugin.ts \
 
 ## Current parity notes
 
-- Some first-party Discord routing behavior is still hardcoded behind `channel === "discord"`; Discordian compensates for the important thread-route case by creating exact custom-channel thread routes itself.
+- Some first-party Discord routing behavior is still hardcoded behind `channel === "discord"`; Discordian compensates by creating exact custom-channel channel/thread routes itself before delivering inbound messages. New Discordian channel/thread routes create fresh Letta conversations via the public conversations API instead of falling back to the account/default conversation. The API key comes from `DISCORDIAN_LETTA_API_KEY` or nested `config.discordian_letta_api_key`. The base URL intentionally follows Letta Code's `LETTA_BASE_URL` environment/default instead of a per-account override.
 - Native transcription is stubbed in the custom plugin copy. Audio attachments are delivered as local files, but adapter-native automatic voice transcription should be treated as a future parity enhancement.
 - `MessageChannel` send/react and inbound reaction notifications have been live-tested through the custom channel path.
 
@@ -224,11 +224,10 @@ if (isThread && effectiveThreadId) {
 
 3. Route derivation rules:
 
-- If a parent-channel route exists, inherit its `agentId` and `conversationId`.
-- Else if account config has `agent_id`, use that agent.
-- Conversation strategy options:
-  - Short-term/simple: use configured `conversationId` / `LETTA_CONVERSATION_ID` / existing shared conversation fallback when available.
-  - Better parity: create a new per-thread conversation for the configured agent, matching native Discord's thread-scoped conversation behavior.
+- Use account config `agent_id`; if it is missing, do not auto-create a new route.
+- For new routes, create a fresh Letta conversation for that agent through the public conversations API.
+- Never inherit `conversationId` from a parent-channel route, `config.conversationId`, `LETTA_CONVERSATION_ID`, or `"default"`.
+- If a legacy incomplete thread route already exists with `chatId === threadId` and `threadId: null`, migrate only the route metadata and preserve its existing `conversationId`.
 
 4. Persist route shape exactly as generic custom-channel matching expects:
 
@@ -328,7 +327,7 @@ For messages inside Discord threads, `gateChannelId` is the parent channel id wh
 
 When `conversation` is omitted, mention-triggered entries inherit the account-level `auto_thread_on_mention` default (`true` -> `thread`, `false` -> `channel`); non-mention triggers default to `channel`.
 
-For `conversation: "channel"`, Discordian auto-creates a top-level channel route when `agent_id` is configured. For `conversation: "thread"`, Discordian reuses the exact thread route creation/migration path. Existing thread messages under a parent channel use route repair so externally-created Discord/Needle threads continue working without manual route edits. Reaction events follow the same effective parent-channel config for thread messages.
+For `conversation: "channel"`, Discordian auto-creates a top-level channel route with a fresh Letta conversation when `agent_id` is configured. For `conversation: "thread"`, Discordian reuses the exact thread route creation/migration path and creates a fresh Letta conversation for each new Discord thread. Existing thread messages under a parent channel use route repair so externally-created Discord/Needle threads continue working without manual route edits. Parent-channel thread-starter events for manually-created Discord threads are suppressed to avoid duplicate parent-channel replies. Reaction events follow the same effective parent-channel config for thread messages.
 
 ## Operational note: duplicate listeners
 

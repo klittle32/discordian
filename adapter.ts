@@ -6,8 +6,6 @@ import {
 import { formatDiscordDeliveryError } from "./error-reply";
 import {
   resolveDiscordInboundAttachments,
-  resolveDiscordThreadHistory,
-  resolveDiscordThreadStarter,
 } from "./media";
 import { CHANNEL_ID, DISPLAY_NAME, loadDiscordModule } from "./runtime.mjs";
 
@@ -58,6 +56,8 @@ interface DiscordFetchedMessageLike {
   fetch?: () => Promise<DiscordFetchedMessageLike>;
   react: (emoji: string) => Promise<unknown>;
   reactions: DiscordReactionStoreLike;
+  hasThread?: boolean;
+  thread?: { id?: string | null } | null;
 }
 
 interface DiscordThreadLike {
@@ -149,6 +149,50 @@ interface DiscordianRoutesFile {
   routes?: DiscordianRoute[];
 }
 
+interface LettaConversationCreateResponse {
+  id?: string;
+}
+
+type DiscordianRouteLockKey = string;
+
+// Mirrors first-party Letta Code channel conversation creation. The current
+// bundled value is empty, but keep the field explicit so parity is obvious and
+// easy to update if Letta Code exposes non-empty isolated labels later.
+const DISCORDIAN_ISOLATED_BLOCK_LABELS: string[] = [];
+
+function normalizeLettaBaseUrl(): string {
+  const raw = process.env.LETTA_BASE_URL || "https://api.letta.com";
+  return raw.replace(/\/+$/, "");
+}
+
+function resolveLettaApiKey(config: Record<string, unknown>): string | null {
+  const envValue = process.env.DISCORDIAN_LETTA_API_KEY;
+  if (envValue && envValue.trim().length > 0) {
+    return envValue.trim();
+  }
+  const configured = config.discordianLettaApiKey ?? config.discordian_letta_api_key;
+  return typeof configured === "string" && configured.trim().length > 0
+    ? configured.trim()
+    : null;
+}
+
+function buildDiscordianConversationSummary(input: {
+  chatKind: "channel" | "thread";
+  discordChatId: string;
+  parentChannelId?: string | null;
+}): string {
+  if (input.chatKind === "thread") {
+    return input.parentChannelId
+      ? `Discordian thread ${input.discordChatId} in channel ${input.parentChannelId}`
+      : `Discordian thread ${input.discordChatId}`;
+  }
+  return `Discordian channel ${input.discordChatId}`;
+}
+
+function asErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 type DiscordMessage = DiscordMessageLike;
 
 const DISCORD_SPLIT_THRESHOLD = 1900;
@@ -157,7 +201,6 @@ const INGRESS_DEDUPE_MAX = 2_000;
 const LIFECYCLE_STATE_TTL_MS = 6 * 60 * 60 * 1000;
 const LIFECYCLE_STATE_MAX = 2_000;
 const DISCORD_LIFECYCLE_ERROR_TEXT_MAX = 1500;
-const INITIAL_THREAD_HISTORY_LIMIT = 20;
 
 function formatChannelLifecycleErrorMessage(errorText: string, options: { codeBlock?: boolean; maxLength?: number } = {}): string {
   const maxLength = options.maxLength ?? 1500;
@@ -357,6 +400,7 @@ export function createDiscordAdapter(
   >();
   const lifecycleOperationByMessageKey = new Map<string, Promise<void>>();
   const lifecycleErrorReplyKeys = new Map<string, number>();
+  const discordianRouteLocks = new Map<DiscordianRouteLockKey, Promise<void>>();
 
   function pruneSeenIngressMessageKeys(now: number = Date.now()): void {
     for (const [key, expiresAt] of seenIngressMessageKeys) {
@@ -643,6 +687,29 @@ export function createDiscordAdapter(
     return typeof ch.isThread === "function" && ch.isThread();
   }
 
+  function isDiscordThreadStarterMessage(message: DiscordFetchedMessageLike): boolean {
+    return message.hasThread === true || Boolean(message.thread?.id);
+  }
+
+  async function sleep(ms: number): Promise<void> {
+    await new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  async function isParentChannelThreadStarterMessage(message: DiscordMessage): Promise<boolean> {
+    if (isDiscordThreadStarterMessage(message)) return true;
+    try {
+      await sleep(THREAD_STARTER_REFETCH_DELAY_MS);
+      const fetched = await message.channel.messages?.fetch(message.id);
+      return fetched ? isDiscordThreadStarterMessage(fetched) : false;
+    } catch (error) {
+      console.warn(
+        "[Discordian] Failed to refetch possible thread starter",
+        error instanceof Error ? error.message : error,
+      );
+      return false;
+    }
+  }
+
   function isDiscordThreadAlreadyExistsError(error: unknown): boolean {
     const message = error instanceof Error ? error.message : String(error);
     return message.toLowerCase().includes("thread has already been created");
@@ -715,49 +782,140 @@ export function createDiscordAdapter(
     routes: DiscordianRoute[],
   ): Promise<void> {
     await fs.mkdir(dirname(routingPath), { recursive: true });
+    const tmpPath = `${routingPath}.${process.pid}.${Date.now()}.tmp`;
     await fs.writeFile(
-      routingPath,
+      tmpPath,
       JSON.stringify({ routes }, null, 2) + "\n",
       "utf8",
     );
+    await fs.rename(tmpPath, routingPath);
+  }
+
+  async function runDiscordianRouteLocked(
+    key: DiscordianRouteLockKey,
+    operation: () => Promise<void>,
+  ): Promise<void> {
+    const previous = discordianRouteLocks.get(key) ?? Promise.resolve();
+    const next = previous.catch(() => undefined).then(operation);
+    discordianRouteLocks.set(key, next);
+    try {
+      await next;
+    } finally {
+      if (discordianRouteLocks.get(key) === next) {
+        discordianRouteLocks.delete(key);
+      }
+    }
+  }
+
+  async function createDiscordianConversationRouteTarget(input: {
+    agentId: string;
+    chatKind: "channel" | "thread";
+    discordChatId: string;
+    parentChannelId?: string | null;
+  }): Promise<string> {
+    const apiKey = resolveLettaApiKey(config);
+    if (!apiKey) {
+      throw new Error(
+        "Cannot create Discordian route conversation: missing DISCORDIAN_LETTA_API_KEY or config.discordian_letta_api_key",
+      );
+    }
+
+    const baseUrl = normalizeLettaBaseUrl();
+    const url = new URL(`${baseUrl}/v1/conversations/`);
+    url.searchParams.set("agent_id", input.agentId);
+
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        isolated_block_labels: DISCORDIAN_ISOLATED_BLOCK_LABELS,
+        summary: buildDiscordianConversationSummary(input),
+      }),
+    });
+
+    if (!response.ok) {
+      let details = response.statusText;
+      try {
+        details = await response.text();
+      } catch {}
+      throw new Error(
+        `Letta conversation creation failed (${response.status}): ${details}`,
+      );
+    }
+
+    const conversation = await response.json() as LettaConversationCreateResponse;
+    if (!conversation.id) {
+      throw new Error("Letta conversation creation returned no conversation id");
+    }
+    return conversation.id;
   }
 
   async function ensureDiscordianChannelRoute(channelId: string): Promise<void> {
     if (!config.agentId) return;
-    const { routingPath, routes } = await getDiscordianRoutes();
-    const existingRoute = routes.find(
-      (route) =>
-        route.accountId === config.accountId &&
-        route.chatId === channelId &&
-        (route.threadId ?? null) === null &&
-        route.enabled !== false,
-    );
-    if (existingRoute) return;
+    // Route creation is a read/modify/write of one routing file. Serialize all
+    // Discordian route mutations in-process, not just identical chat ids, so
+    // concurrent first messages in different channels/threads do not overwrite
+    // each other's newly-added routes.
+    const lockKey = `${config.accountId}:routes`;
+    await runDiscordianRouteLocked(lockKey, async () => {
+      const { routingPath, routes } = await getDiscordianRoutes();
+      const existingRoute = routes.find(
+        (route) =>
+          route.accountId === config.accountId &&
+          route.chatId === channelId &&
+          (route.threadId ?? null) === null &&
+          route.enabled !== false,
+      );
+      if (existingRoute) return;
 
-    const now = new Date().toISOString();
-    const route = {
-      accountId: config.accountId,
-      chatId: channelId,
-      chatType: "channel",
-      threadId: null,
-      agentId: config.agentId,
-      conversationId:
-        config.conversationId ?? process.env.LETTA_CONVERSATION_ID ?? "default",
-      enabled: true,
-      createdAt: now,
-      updatedAt: now,
-    };
-    routes.push(route);
-    await saveDiscordianRoutes(routingPath, routes);
-    console.log(
-      "[Discordian] Created channel route",
-      JSON.stringify({
+      let conversationId: string;
+      try {
+        conversationId = await createDiscordianConversationRouteTarget({
+          agentId: config.agentId,
+          chatKind: "channel",
+          discordChatId: channelId,
+        });
+      } catch (error) {
+        console.error(
+          "[Discordian] Failed to create channel route conversation",
+          JSON.stringify({
+            accountId: config.accountId,
+            channelId,
+            agentId: config.agentId,
+            baseUrl: normalizeLettaBaseUrl(),
+            error: asErrorMessage(error),
+          }),
+        );
+        throw error;
+      }
+
+      const now = new Date().toISOString();
+      const route = {
         accountId: config.accountId,
-        channelId,
-        agentId: route.agentId,
-        conversationId: route.conversationId,
-      }),
-    );
+        chatId: channelId,
+        chatType: "channel",
+        threadId: null,
+        agentId: config.agentId,
+        conversationId,
+        enabled: true,
+        createdAt: now,
+        updatedAt: now,
+      };
+      routes.push(route);
+      await saveDiscordianRoutes(routingPath, routes);
+      console.log(
+        "[Discordian] Created channel route",
+        JSON.stringify({
+          accountId: config.accountId,
+          channelId,
+          agentId: route.agentId,
+          conversationId: route.conversationId,
+        }),
+      );
+    });
   }
 
   async function ensureDiscordianThreadRoute(
@@ -765,69 +923,89 @@ export function createDiscordAdapter(
     threadId: string,
   ): Promise<void> {
     if (!config.agentId) return;
-    const { routingPath, routes } = await getDiscordianRoutes();
-    const existingExactRoute = routes.find(
-      (route) =>
-        route.accountId === config.accountId &&
-        route.chatId === threadId &&
-        route.threadId === threadId &&
-        route.enabled !== false,
-    );
-    if (existingExactRoute) return;
+    // Route creation is a read/modify/write of one routing file. Serialize all
+    // Discordian route mutations in-process, not just identical chat ids, so
+    // concurrent first messages in different channels/threads do not overwrite
+    // each other's newly-added routes.
+    const lockKey = `${config.accountId}:routes`;
+    await runDiscordianRouteLocked(lockKey, async () => {
+      const { routingPath, routes } = await getDiscordianRoutes();
+      const existingExactRoute = routes.find(
+        (route) =>
+          route.accountId === config.accountId &&
+          route.chatId === threadId &&
+          route.threadId === threadId &&
+          route.enabled !== false,
+      );
+      if (existingExactRoute) return;
 
-    const incompleteThreadRoute = routes.find(
-      (route) =>
-        route.accountId === config.accountId &&
-        route.chatId === threadId &&
-        (route.threadId ?? null) === null &&
-        route.enabled !== false,
-    );
-    if (incompleteThreadRoute) {
-      incompleteThreadRoute.threadId = threadId;
-      incompleteThreadRoute.chatType = incompleteThreadRoute.chatType ?? "channel";
-      incompleteThreadRoute.updatedAt = new Date().toISOString();
+      const incompleteThreadRoute = routes.find(
+        (route) =>
+          route.accountId === config.accountId &&
+          route.chatId === threadId &&
+          (route.threadId ?? null) === null &&
+          route.enabled !== false,
+      );
+      if (incompleteThreadRoute) {
+        incompleteThreadRoute.threadId = threadId;
+        incompleteThreadRoute.chatType = incompleteThreadRoute.chatType ?? "channel";
+        incompleteThreadRoute.updatedAt = new Date().toISOString();
+        await saveDiscordianRoutes(routingPath, routes);
+        console.log(
+          "[Discordian] Migrated thread route",
+          JSON.stringify({ accountId: config.accountId, parentChannelId, threadId }),
+        );
+        return;
+      }
+
+      let conversationId: string;
+      try {
+        conversationId = await createDiscordianConversationRouteTarget({
+          agentId: config.agentId,
+          chatKind: "thread",
+          discordChatId: threadId,
+          parentChannelId,
+        });
+      } catch (error) {
+        console.error(
+          "[Discordian] Failed to create thread route conversation",
+          JSON.stringify({
+            accountId: config.accountId,
+            parentChannelId,
+            threadId,
+            agentId: config.agentId,
+            baseUrl: normalizeLettaBaseUrl(),
+            error: asErrorMessage(error),
+          }),
+        );
+        throw error;
+      }
+
+      const now = new Date().toISOString();
+      const route = {
+        accountId: config.accountId,
+        chatId: threadId,
+        chatType: "channel",
+        threadId,
+        agentId: config.agentId,
+        conversationId,
+        enabled: true,
+        createdAt: now,
+        updatedAt: now,
+      };
+      routes.push(route);
       await saveDiscordianRoutes(routingPath, routes);
       console.log(
-        "[Discordian] Migrated thread route",
-        JSON.stringify({ accountId: config.accountId, parentChannelId, threadId }),
+        "[Discordian] Created thread route",
+        JSON.stringify({
+          accountId: config.accountId,
+          parentChannelId,
+          threadId,
+          agentId: route.agentId,
+          conversationId: route.conversationId,
+        }),
       );
-      return;
-    }
-    const parentRoute = routes.find(
-      (route) =>
-        route.accountId === config.accountId &&
-        route.chatId === parentChannelId &&
-        (route.threadId ?? null) === null &&
-        route.enabled !== false,
-    );
-    const now = new Date().toISOString();
-    const route = {
-      accountId: config.accountId,
-      chatId: threadId,
-      chatType: "channel",
-      threadId,
-      agentId: parentRoute?.agentId ?? config.agentId,
-      conversationId:
-        parentRoute?.conversationId ??
-        config.conversationId ??
-        process.env.LETTA_CONVERSATION_ID ??
-        "default",
-      enabled: true,
-      createdAt: now,
-      updatedAt: now,
-    };
-    routes.push(route);
-    await saveDiscordianRoutes(routingPath, routes);
-    console.log(
-      "[Discordian] Created thread route",
-      JSON.stringify({
-        accountId: config.accountId,
-        parentChannelId,
-        threadId,
-        agentId: route.agentId,
-        conversationId: route.conversationId,
-      }),
-    );
+    });
   }
 
   async function collectAttachments(
@@ -977,6 +1155,24 @@ export function createDiscordAdapter(
           channelPolicy.trigger === "always" ||
           (channelPolicy.trigger === "mention" && wasMentioned);
         if (!shouldTrigger) return;
+
+        // Discord emits the thread starter as a normal parent-channel message
+        // and then emits subsequent messages inside the thread. `hasThread` may
+        // not be populated immediately on the messageCreate payload, so briefly
+        // refetch before allowing a top-level channel route to answer. Let the
+        // actual thread message path create/use the thread route instead.
+        if (!isThread && (await isParentChannelThreadStarterMessage(message))) {
+          console.log(
+            "[Discordian] Ignoring parent-channel thread starter",
+            JSON.stringify({
+              accountId: config.accountId,
+              channelId: message.channelId,
+              messageId: message.id,
+              threadId: message.thread?.id ?? message.id,
+            }),
+          );
+          return;
+        }
 
         if (markIngressMessageSeen(message.id)) return;
 
@@ -1332,59 +1528,11 @@ export function createDiscordAdapter(
       msg,
       options?: { isFirstRouteTurn?: boolean },
     ) {
-      if (
-        !options?.isFirstRouteTurn ||
-        msg.channel !== CHANNEL_ID ||
-        msg.chatType !== "channel" ||
-        !isNonEmptyString(msg.threadId) ||
-        !client
-      ) {
-        return msg;
-      }
-
-      const starter = await resolveDiscordThreadStarter({
-        client,
-        threadChannelId: msg.threadId,
-      });
-      const history = await resolveDiscordThreadHistory({
-        client,
-        threadChannelId: msg.threadId,
-        currentMessageId: msg.messageId,
-        limit: INITIAL_THREAD_HISTORY_LIMIT,
-      });
-
-      if (!starter && history.length === 0) {
-        return msg;
-      }
-
-      const label = msg.chatLabel
-        ? `Discord thread in ${msg.chatLabel}`
-        : `Discord thread ${msg.chatId}`;
-
-      return {
-        ...msg,
-        threadContext: {
-          label,
-          ...(starter
-            ? {
-                starter: {
-                  messageId: starter.id,
-                  senderId: starter.userId ?? starter.botId,
-                  text: starter.text,
-                },
-              }
-            : {}),
-          ...(history.length > 0
-            ? {
-                history: history.map((entry) => ({
-                  messageId: entry.id,
-                  senderId: entry.userId ?? entry.botId,
-                  text: entry.text,
-                })),
-              }
-            : {}),
-        },
-      };
+      // Discordian creates a fresh Letta conversation for every new Discord
+      // channel/thread route. Do not hydrate the first turn with Discord thread
+      // starter/history; the triggering inbound message should be the new
+      // conversation's first user message.
+      return msg;
     },
 
     onMessage: undefined,

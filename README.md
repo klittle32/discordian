@@ -104,7 +104,9 @@ Channel resolution uses: exact channel entry → `"*"` wildcard entry → accoun
 
 `comment` and `channel_name` are optional human-readable metadata fields for easier manual inspection of `accounts.json`. Discordian ignores them; the channel ID key remains authoritative.
 
-For existing Discord threads under allowed parent channels, Discordian performs route repair: it creates or migrates the exact thread route needed by Letta's generic custom-channel registry before forwarding the inbound message. This keeps externally-created threads working without manual `routing.yaml` edits.
+For `conversation: "channel"`, Discordian creates a dedicated Letta conversation the first time a top-level Discord channel needs a route, then reuses that route for later messages in the same channel. For `conversation: "thread"`, and for existing Discord threads under allowed parent channels, Discordian creates a dedicated Letta conversation for each Discord thread before forwarding the first inbound message. New routes never inherit the account/default conversation, `LETTA_CONVERSATION_ID`, a parent channel conversation, or `"default"`; existing routes keep their stored conversation ids. Parent-channel thread-starter events for manually-created Discord threads are ignored so the bot replies only in the thread conversation, not both the parent channel and the thread.
+
+Fresh route creation requires Letta API credentials inside the listener process. Prefer `DISCORDIAN_LETTA_API_KEY` for deployment; for quick local testing, set nested `config.discordian_letta_api_key` in the Discordian account. The example config omits this optional secret so accidental copy/paste does not put API keys in JSON. The account key name is intentionally Discordian-specific because it is only for Discordian's public-API route creation workaround. Discordian uses Letta Code's `LETTA_BASE_URL` environment when present and otherwise defaults to `https://api.letta.com`; there is intentionally no per-account base URL override to avoid creating routes against a different backend than the running listener.
 
 ## Development notes
 

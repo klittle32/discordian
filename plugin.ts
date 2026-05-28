@@ -22,6 +22,18 @@ function readConfig(account, key, fallback = undefined) {
   return readTopLevel(account, key, fallback);
 }
 
+function resolveDiscordianCredentialSource(account) {
+  const envValue = process.env.DISCORDIAN_LETTA_API_KEY;
+  if (typeof envValue === "string" && envValue.trim().length > 0) {
+    return "DISCORDIAN_LETTA_API_KEY";
+  }
+  const configured = readConfig(account, "discordian_letta_api_key", null);
+  if (typeof configured === "string" && configured.trim().length > 0) {
+    return "config.discordian_letta_api_key";
+  }
+  return "missing";
+}
+
 function normalizeAccount(account) {
   const discordianDmPolicy = readNestedConfig(account, "dm_policy", "allowlist");
   const discordianAllowedUsers = readNestedConfig(account, "allowed_users", []);
@@ -34,6 +46,7 @@ function normalizeAccount(account) {
     enabled: account.enabled !== false,
     token: readConfig(account, "token", ""),
     agentId: readConfig(account, "agentId", readConfig(account, "agent_id", null)),
+    discordianLettaApiKey: readConfig(account, "discordian_letta_api_key", null),
     defaultPermissionMode: readConfig(
       account,
       "defaultPermissionMode",
@@ -99,6 +112,17 @@ export const channelPlugin = {
 
   createAdapter(account) {
     const normalized = normalizeAccount(account);
+    const baseUrl = (process.env.LETTA_BASE_URL || "https://api.letta.com").replace(/\/+$/, "");
+    console.log(
+      "[Discordian] Loaded plugin",
+      JSON.stringify({
+        build: "public-api-route-conversations",
+        accountId: normalized.accountId,
+        agentConfigured: typeof normalized.agentId === "string" && normalized.agentId.length > 0,
+        credentialSource: resolveDiscordianCredentialSource(account),
+        baseUrl,
+      }),
+    );
 
     // The channel registry keeps and later consults this same account object
     // for generic custom-channel dmPolicy enforcement. Mutate the live account
