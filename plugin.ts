@@ -2,17 +2,30 @@ import { createDiscordAdapter } from "./adapter";
 import { discordianMessageActions } from "./message-actions";
 import { CHANNEL_ID, DISPLAY_NAME } from "./runtime.mjs";
 
-function readConfig(account, key, fallback = undefined) {
+function readTopLevel(account, key, fallback = undefined) {
   if (account && Object.prototype.hasOwnProperty.call(account, key)) {
     return account[key];
   }
+  return fallback;
+}
+
+function readNestedConfig(account, key, fallback = undefined) {
   if (account?.config && Object.prototype.hasOwnProperty.call(account.config, key)) {
     return account.config[key];
   }
   return fallback;
 }
 
+function readConfig(account, key, fallback = undefined) {
+  const nested = readNestedConfig(account, key, undefined);
+  if (nested !== undefined) return nested;
+  return readTopLevel(account, key, fallback);
+}
+
 function normalizeAccount(account) {
+  const discordianDmPolicy = readNestedConfig(account, "dm_policy", "allowlist");
+  const discordianAllowedUsers = readNestedConfig(account, "allowed_users", []);
+
   return {
     ...account,
     channel: CHANNEL_ID,
@@ -26,8 +39,13 @@ function normalizeAccount(account) {
       "defaultPermissionMode",
       readConfig(account, "default_permission_mode", "standard"),
     ),
-    dmPolicy: readConfig(account, "dmPolicy", readConfig(account, "dm_policy", "pairing")),
-    allowedUsers: readConfig(account, "allowedUsers", readConfig(account, "allowed_users", [])),
+    discordianDmPolicy,
+    discordianAllowedUsers,
+    // Discordian enforces Discord-style DM/bot authorization in the adapter.
+    // Keep the generic custom-channel registry open so its global dmPolicy
+    // check does not incorrectly reject guild/thread messages.
+    dmPolicy: "open",
+    allowedUsers: [],
     allowedChannels: readConfig(
       account,
       "allowedChannels",
@@ -63,6 +81,16 @@ function normalizeAccount(account) {
       "transcribeVoice",
       readConfig(account, "transcribe_voice", false),
     ),
+    respondToBots: readConfig(
+      account,
+      "respondToBots",
+      readConfig(account, "respond_to_bots", false),
+    ) === true,
+    allowedBotIds: readConfig(
+      account,
+      "allowedBotIds",
+      readConfig(account, "allowed_bot_ids", []),
+    ),
   };
 }
 
@@ -75,7 +103,17 @@ export const channelPlugin = {
   },
 
   createAdapter(account) {
-    return createDiscordAdapter(normalizeAccount(account));
+    const normalized = normalizeAccount(account);
+
+    // The channel registry keeps and later consults this same account object
+    // for generic custom-channel dmPolicy enforcement. Mutate the live account
+    // to open after preserving the original policy in `normalized`, so
+    // Discordian-owned adapter auth can enforce DM/bot rules without the
+    // generic registry rejecting guild/thread messages.
+    account.dmPolicy = "open";
+    account.allowedUsers = [];
+
+    return createDiscordAdapter(normalized);
   },
 
   messageActions: discordianMessageActions,

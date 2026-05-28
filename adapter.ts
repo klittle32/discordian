@@ -382,6 +382,39 @@ export function createDiscordAdapter(
     return false;
   }
 
+  function normalizedStringList(value: unknown): string[] {
+    return Array.isArray(value)
+      ? value.filter(
+          (item: unknown): item is string =>
+            typeof item === "string" && item.trim().length > 0,
+        )
+      : [];
+  }
+
+  function shouldProcessDiscordSender(
+    user: DiscordUserLike,
+    chatType: "direct" | "channel",
+  ): boolean {
+    if (!user.id) return false;
+    if (user.id === botUserId) return false;
+
+    if (user.bot) {
+      if (config.respondToBots !== true) return false;
+      const allowedBotIds = normalizedStringList(config.allowedBotIds);
+      if (allowedBotIds.length === 0) return true;
+      return allowedBotIds.includes(user.id);
+    }
+
+    if (chatType === "direct") {
+      const discordianDmPolicy = config.discordianDmPolicy ?? config.dmPolicy;
+      if (discordianDmPolicy === "allowlist") {
+        return normalizedStringList(config.discordianAllowedUsers).includes(user.id);
+      }
+    }
+
+    return true;
+  }
+
   function getLifecycleMessageKey(source): string | null {
     if (
       source.channel !== CHANNEL_ID ||
@@ -620,15 +653,36 @@ export function createDiscordAdapter(
       const parsed = JSON.parse(await fs.readFile(routingPath, "utf8"));
       routes = Array.isArray(parsed.routes) ? parsed.routes : [];
     } catch {}
-    if (
-      routes.some(
-        (route) =>
-          route.accountId === config.accountId &&
-          route.chatId === threadId &&
-          route.threadId === threadId &&
-          route.enabled !== false,
-      )
-    ) {
+    const existingExactRoute = routes.find(
+      (route) =>
+        route.accountId === config.accountId &&
+        route.chatId === threadId &&
+        route.threadId === threadId &&
+        route.enabled !== false,
+    );
+    if (existingExactRoute) return;
+
+    const incompleteThreadRoute = routes.find(
+      (route) =>
+        route.accountId === config.accountId &&
+        route.chatId === threadId &&
+        (route.threadId ?? null) === null &&
+        route.enabled !== false,
+    );
+    if (incompleteThreadRoute) {
+      incompleteThreadRoute.threadId = threadId;
+      incompleteThreadRoute.chatType = incompleteThreadRoute.chatType ?? "channel";
+      incompleteThreadRoute.updatedAt = new Date().toISOString();
+      await fs.mkdir(path.dirname(routingPath), { recursive: true });
+      await fs.writeFile(
+        routingPath,
+        JSON.stringify({ routes }, null, 2) + "\n",
+        "utf8",
+      );
+      console.log(
+        "[Discordian] Migrated thread route",
+        JSON.stringify({ accountId: config.accountId, parentChannelId, threadId }),
+      );
       return;
     }
     const parentRoute = routes.find(
@@ -639,7 +693,7 @@ export function createDiscordAdapter(
         route.enabled !== false,
     );
     const now = new Date().toISOString();
-    routes.push({
+    const route = {
       accountId: config.accountId,
       chatId: threadId,
       chatType: "channel",
@@ -653,12 +707,23 @@ export function createDiscordAdapter(
       enabled: true,
       createdAt: now,
       updatedAt: now,
-    });
+    };
+    routes.push(route);
     await fs.mkdir(path.dirname(routingPath), { recursive: true });
     await fs.writeFile(
       routingPath,
       JSON.stringify({ routes }, null, 2) + "\n",
       "utf8",
+    );
+    console.log(
+      "[Discordian] Created thread route",
+      JSON.stringify({
+        accountId: config.accountId,
+        parentChannelId,
+        threadId,
+        agentId: route.agentId,
+        conversationId: route.conversationId,
+      }),
     );
   }
 
@@ -723,14 +788,20 @@ export function createDiscordAdapter(
       client.on("messageCreate", async (message: DiscordMessage) => {
         if (!adapter.onMessage) return;
 
-        // Ignore bot messages (including self)
-        if (message.author.bot) return;
-
         const content = (message.content ?? "").trim();
         const userId = message.author.id;
         if (!userId) return;
 
         const chatType = resolveDiscordChatType(message.guildId);
+        if (!shouldProcessDiscordSender(message.author, chatType)) {
+          if (chatType === "direct" && !message.author.bot) {
+            await adapter.sendDirectReply(
+              message.channelId,
+              "You are not on the allowed users list for this Discordian bot.",
+            );
+          }
+          return;
+        }
         const isThread = isThreadMessage(message);
         const wasMentioned = chatType === "channel" && hasBotMention(message);
 
@@ -816,6 +887,11 @@ export function createDiscordAdapter(
           effectiveChatId = createdThread.id;
           effectiveThreadId = createdThread.id;
           await ensureDiscordianThreadRoute(message.channelId, createdThread.id);
+        } else if (isThread && effectiveThreadId) {
+          await ensureDiscordianThreadRoute(
+            parentChannelId ?? message.channelId,
+            effectiveThreadId,
+          );
         }
 
         const attachments = await collectAttachments(
@@ -867,9 +943,8 @@ export function createDiscordAdapter(
         action: "added" | "removed",
       ) => {
         if (!adapter.onMessage) return;
-        // Ignore bot reactions
-        if (user.bot) return;
-        if (user.id === botUserId) return;
+        const reactionChatType = resolveDiscordChatType(reaction.message.guildId);
+        if (!shouldProcessDiscordSender(user, reactionChatType)) return;
 
         try {
           if (reaction.partial) await reaction.fetch();

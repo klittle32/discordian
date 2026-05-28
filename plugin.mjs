@@ -430,6 +430,30 @@ function createDiscordAdapter(config) {
     seenIngressMessageKeys.set(key, now + INGRESS_DEDUPE_TTL_MS);
     return false;
   }
+  function normalizedStringList(value) {
+    return Array.isArray(value) ? value.filter((item) => typeof item === "string" && item.trim().length > 0) : [];
+  }
+  function shouldProcessDiscordSender(user, chatType) {
+    if (!user.id)
+      return false;
+    if (user.id === botUserId)
+      return false;
+    if (user.bot) {
+      if (config.respondToBots !== true)
+        return false;
+      const allowedBotIds = normalizedStringList(config.allowedBotIds);
+      if (allowedBotIds.length === 0)
+        return true;
+      return allowedBotIds.includes(user.id);
+    }
+    if (chatType === "direct") {
+      const discordianDmPolicy = config.discordianDmPolicy ?? config.dmPolicy;
+      if (discordianDmPolicy === "allowlist") {
+        return normalizedStringList(config.discordianAllowedUsers).includes(user.id);
+      }
+    }
+    return true;
+  }
   function getLifecycleMessageKey(source) {
     if (source.channel !== CHANNEL_ID || !isNonEmptyString(source.chatId) || !isNonEmptyString(source.messageId)) {
       return null;
@@ -607,12 +631,23 @@ function createDiscordAdapter(config) {
       const parsed = JSON.parse(await fs.readFile(routingPath, "utf8"));
       routes = Array.isArray(parsed.routes) ? parsed.routes : [];
     } catch {}
-    if (routes.some((route) => route.accountId === config.accountId && route.chatId === threadId && route.threadId === threadId && route.enabled !== false)) {
+    const existingExactRoute = routes.find((route2) => route2.accountId === config.accountId && route2.chatId === threadId && route2.threadId === threadId && route2.enabled !== false);
+    if (existingExactRoute)
+      return;
+    const incompleteThreadRoute = routes.find((route2) => route2.accountId === config.accountId && route2.chatId === threadId && (route2.threadId ?? null) === null && route2.enabled !== false);
+    if (incompleteThreadRoute) {
+      incompleteThreadRoute.threadId = threadId;
+      incompleteThreadRoute.chatType = incompleteThreadRoute.chatType ?? "channel";
+      incompleteThreadRoute.updatedAt = new Date().toISOString();
+      await fs.mkdir(path.dirname(routingPath), { recursive: true });
+      await fs.writeFile(routingPath, JSON.stringify({ routes }, null, 2) + `
+`, "utf8");
+      console.log("[Discordian] Migrated thread route", JSON.stringify({ accountId: config.accountId, parentChannelId, threadId }));
       return;
     }
-    const parentRoute = routes.find((route) => route.accountId === config.accountId && route.chatId === parentChannelId && (route.threadId ?? null) === null && route.enabled !== false);
+    const parentRoute = routes.find((route2) => route2.accountId === config.accountId && route2.chatId === parentChannelId && (route2.threadId ?? null) === null && route2.enabled !== false);
     const now = new Date().toISOString();
-    routes.push({
+    const route = {
       accountId: config.accountId,
       chatId: threadId,
       chatType: "channel",
@@ -622,10 +657,18 @@ function createDiscordAdapter(config) {
       enabled: true,
       createdAt: now,
       updatedAt: now
-    });
+    };
+    routes.push(route);
     await fs.mkdir(path.dirname(routingPath), { recursive: true });
     await fs.writeFile(routingPath, JSON.stringify({ routes }, null, 2) + `
 `, "utf8");
+    console.log("[Discordian] Created thread route", JSON.stringify({
+      accountId: config.accountId,
+      parentChannelId,
+      threadId,
+      agentId: route.agentId,
+      conversationId: route.conversationId
+    }));
   }
   async function collectAttachments(rawAttachments, chatId) {
     const list = Array.from(rawAttachments.values());
@@ -679,13 +722,17 @@ function createDiscordAdapter(config) {
       client.on("messageCreate", async (message) => {
         if (!adapter.onMessage)
           return;
-        if (message.author.bot)
-          return;
         const content = (message.content ?? "").trim();
         const userId = message.author.id;
         if (!userId)
           return;
         const chatType = resolveDiscordChatType(message.guildId);
+        if (!shouldProcessDiscordSender(message.author, chatType)) {
+          if (chatType === "direct" && !message.author.bot) {
+            await adapter.sendDirectReply(message.channelId, "You are not on the allowed users list for this Discordian bot.");
+          }
+          return;
+        }
         const isThread = isThreadMessage(message);
         const wasMentioned = chatType === "channel" && hasBotMention(message);
         if (chatType === "direct") {
@@ -740,6 +787,8 @@ function createDiscordAdapter(config) {
           effectiveChatId = createdThread.id;
           effectiveThreadId = createdThread.id;
           await ensureDiscordianThreadRoute(message.channelId, createdThread.id);
+        } else if (isThread && effectiveThreadId) {
+          await ensureDiscordianThreadRoute(parentChannelId ?? message.channelId, effectiveThreadId);
         }
         const attachments = await collectAttachments(message.attachments, effectiveChatId);
         const normalizedText = wasMentioned ? normalizeDiscordMentionText(content, botUserId) : content;
@@ -773,9 +822,8 @@ function createDiscordAdapter(config) {
       const handleReactionEvent = async (reaction, user, action) => {
         if (!adapter.onMessage)
           return;
-        if (user.bot)
-          return;
-        if (user.id === botUserId)
+        const reactionChatType = resolveDiscordChatType(reaction.message.guildId);
+        if (!shouldProcessDiscordSender(user, reactionChatType))
           return;
         try {
           if (reaction.partial)
@@ -1069,16 +1117,27 @@ var discordianMessageActions = {
 };
 
 // plugin.ts
-function readConfig(account, key, fallback = undefined) {
+function readTopLevel(account, key, fallback = undefined) {
   if (account && Object.prototype.hasOwnProperty.call(account, key)) {
     return account[key];
   }
+  return fallback;
+}
+function readNestedConfig(account, key, fallback = undefined) {
   if (account?.config && Object.prototype.hasOwnProperty.call(account.config, key)) {
     return account.config[key];
   }
   return fallback;
 }
+function readConfig(account, key, fallback = undefined) {
+  const nested = readNestedConfig(account, key, undefined);
+  if (nested !== undefined)
+    return nested;
+  return readTopLevel(account, key, fallback);
+}
 function normalizeAccount(account) {
+  const discordianDmPolicy = readNestedConfig(account, "dm_policy", "allowlist");
+  const discordianAllowedUsers = readNestedConfig(account, "allowed_users", []);
   return {
     ...account,
     channel: CHANNEL_ID,
@@ -1088,15 +1147,19 @@ function normalizeAccount(account) {
     token: readConfig(account, "token", ""),
     agentId: readConfig(account, "agentId", readConfig(account, "agent_id", null)),
     defaultPermissionMode: readConfig(account, "defaultPermissionMode", readConfig(account, "default_permission_mode", "standard")),
-    dmPolicy: readConfig(account, "dmPolicy", readConfig(account, "dm_policy", "pairing")),
-    allowedUsers: readConfig(account, "allowedUsers", readConfig(account, "allowed_users", [])),
+    discordianDmPolicy,
+    discordianAllowedUsers,
+    dmPolicy: "open",
+    allowedUsers: [],
     allowedChannels: readConfig(account, "allowedChannels", readConfig(account, "allowed_channels", undefined)),
     autoThreadOnMention: readConfig(account, "autoThreadOnMention", readConfig(account, "auto_thread_on_mention", true)),
     threadPolicyByChannel: readConfig(account, "threadPolicyByChannel", readConfig(account, "thread_policy_by_channel", undefined)),
     inboundDebounceMs: readConfig(account, "inboundDebounceMs", readConfig(account, "inbound_debounce_ms", undefined)),
     acknowledgeMessageReaction: readConfig(account, "acknowledgeMessageReaction", readConfig(account, "acknowledge_message_reaction", false)),
     removeStaleRoutes: readConfig(account, "removeStaleRoutes", readConfig(account, "remove_stale_routes", false)),
-    transcribeVoice: readConfig(account, "transcribeVoice", readConfig(account, "transcribe_voice", false))
+    transcribeVoice: readConfig(account, "transcribeVoice", readConfig(account, "transcribe_voice", false)),
+    respondToBots: readConfig(account, "respondToBots", readConfig(account, "respond_to_bots", false)) === true,
+    allowedBotIds: readConfig(account, "allowedBotIds", readConfig(account, "allowed_bot_ids", []))
   };
 }
 var channelPlugin = {
@@ -1107,7 +1170,10 @@ var channelPlugin = {
     runtimeModules: ["discord.js"]
   },
   createAdapter(account) {
-    return createDiscordAdapter(normalizeAccount(account));
+    const normalized = normalizeAccount(account);
+    account.dmPolicy = "open";
+    account.allowedUsers = [];
+    return createDiscordAdapter(normalized);
   },
   messageActions: discordianMessageActions
 };

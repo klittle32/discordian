@@ -109,3 +109,68 @@ The experiment is still useful if it fails, as long as the failure is reduced to
 ## Development rule
 
 Do not prematurely improve the copied implementation. First make the native behavior run under the custom channel system. Cleanups and redesigns come after the parity boundary is understood.
+
+## Implemented enhancement: Discordian-owned auth and thread routing
+
+Live v1 testing confirmed two custom-channel parity gaps:
+
+1. Generic custom-channel `dmPolicy: allowlist` applies to all inbound custom-channel messages, not just DMs. This blocks bot-originated guild/thread messages even after Discordian's own `respond_to_bots` filter allows them.
+2. Generic custom-channel route matching requires exact `threadId`; externally-created Discord threads need routes with `chatId === threadId` and `threadId === threadId`.
+
+Implemented fix:
+
+- Preserve user-facing Discord-style config in `accounts.json`.
+- Move Discordian-specific human/bot authorization into `adapter.ts`.
+- Avoid relying on the generic custom-channel allowlist for guild/thread authorization.
+- Generalize the thread-route shim so all allowed Discord thread messages, including externally-created bot threads, get exact thread routes before `adapter.onMessage(...)` forwards them.
+- Prefer bot whitelisting with `respond_to_bots: true` plus `allowed_bot_ids`, while supporting broad bot mode with an empty `allowed_bot_ids` array.
+
+See `docs/IMPLEMENTATION_NOTES.md` for the detailed findings, design, and acceptance tests.
+
+## Simplified Discordian custom-channel auth config
+
+Broad bot response and externally-created thread routing are functional. The configuration model now describes intent instead of implementation history.
+
+### Problem with unclear names
+
+Earlier implementation drafts used temporary `original_*` names for Discordian-owned DM policy. Those names exposed migration history instead of intent, so the supported config now uses direct Discordian policy names under `config`.
+
+### Supported config model
+
+Use top-level custom-channel account fields only for Letta's generic registry compatibility:
+
+```json
+{
+  "dmPolicy": "open",
+  "allowedUsers": []
+}
+```
+
+Use `config` for Discordian's actual Discord-aware access policy:
+
+```json
+{
+  "config": {
+    "dm_policy": "allowlist",
+    "allowed_users": ["295423483368964096"],
+    "respond_to_bots": true,
+    "allowed_bot_ids": []
+  }
+}
+```
+
+Meaning:
+
+- top-level `dmPolicy: "open"`: prevent the generic custom-channel registry from applying a global allowlist to guild/thread/bot messages;
+- `config.dm_policy`: Discordian's real DM policy;
+- `config.allowed_users`: Discordian's real DM allowlist;
+- `config.respond_to_bots` / `config.allowed_bot_ids`: Discordian's bot policy.
+
+### Implementation summary
+
+1. Config reading now keeps top-level registry fields and nested Discordian config fields separate.
+2. Normalized internal fields are named `discordianDmPolicy` and `discordianAllowedUsers`.
+3. Interim `original_*` aliases were removed before commit because they were never a stable public config contract.
+4. `accounts.example.json` uses the simplified shape.
+5. Docs explain registry-open compatibility and adapter-owned Discordian policy.
+6. `plugin.mjs` was rebuilt and live-tested after deployment.

@@ -5,7 +5,7 @@
       "accountId": "main",
       "displayName": "Discordian",
       "enabled": true,
-      "dmPolicy": "pairing",
+      "dmPolicy": "open",
       "allowedUsers": [],
       "config": {
         "token": "YOUR_DISCORD_BOT_TOKEN",
@@ -17,7 +17,11 @@
         "acknowledge_message_reaction": false,
         "remove_stale_routes": false,
         "inbound_debounce_ms": 0,
-        "transcribe_voice": false
+        "transcribe_voice": false,
+        "respond_to_bots": false,
+        "allowed_bot_ids": [],
+        "dm_policy": "pairing",
+        "allowed_users": []
       },
       "createdAt": "2026-01-01T00:00:00.000Z",
       "updatedAt": "2026-01-01T00:00:00.000Z"
