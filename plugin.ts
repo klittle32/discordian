@@ -51,20 +51,10 @@ function normalizeAccount(account) {
       "channels",
       readConfig(account, "channels", undefined),
     ),
-    allowedChannels: readConfig(
-      account,
-      "allowedChannels",
-      readConfig(account, "allowed_channels", undefined),
-    ),
     autoThreadOnMention: readConfig(
       account,
       "autoThreadOnMention",
       readConfig(account, "auto_thread_on_mention", true),
-    ),
-    threadPolicyByChannel: readConfig(
-      account,
-      "threadPolicyByChannel",
-      readConfig(account, "thread_policy_by_channel", undefined),
     ),
     inboundDebounceMs: readConfig(
       account,

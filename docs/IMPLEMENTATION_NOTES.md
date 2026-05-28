@@ -307,28 +307,13 @@ The interim `original_*` aliases have been removed from code and examples; use o
 
 ## Per-channel trigger and conversation policies
 
-Discordian now supports a richer per-channel `allowed_channels` object form that separates when the agent is triggered from where the agent conversation lives.
+Discordian uses `config.channels` as a first-class per-channel override map. It is not an allowlist. For any guild message, Discordian resolves the effective config in this order:
 
-Preferred form:
+1. exact channel entry: `channels[gateChannelId]`;
+2. wildcard entry: `channels["*"]`;
+3. account/global defaults.
 
-```json
-{
-  "allowed_channels": {
-    "DISCORD_CHANNEL_A": {
-      "trigger": "mention",
-      "conversation": "channel"
-    },
-    "DISCORD_CHANNEL_B": {
-      "trigger": "always",
-      "conversation": "thread"
-    },
-    "DISCORD_CHANNEL_C": {
-      "trigger": "mention",
-      "conversation": "thread"
-    }
-  }
-}
-```
+For messages inside Discord threads, `gateChannelId` is the parent channel id when available; otherwise it is the message channel id. Missing channel entries are allowed and use global defaults. Use `enabled: false` or `trigger: "never"` to block a channel.
 
 `trigger` controls top-level channel messages:
 
@@ -341,30 +326,9 @@ Preferred form:
 - `channel`: keep the agent conversation in the top-level Discord channel.
 - `thread`: create/use a Discord thread and route replies there.
 
-This makes Needle unnecessary for channels configured as:
+When `conversation` is omitted, mention-triggered entries inherit the account-level `auto_thread_on_mention` default (`true` -> `thread`, `false` -> `channel`); non-mention triggers default to `channel`.
 
-```json
-"DISCORD_CHANNEL_ID": { "trigger": "always", "conversation": "thread" }
-```
-
-Legacy mappings are preserved:
-
-- `allowed_channels: ["CHANNEL_ID"]` maps to mention-triggered behavior, with `conversation` derived from `auto_thread_on_mention`.
-- `"mention"` / `"mention-only"` maps to mention-triggered behavior, with `conversation` derived from `auto_thread_on_mention`.
-- `"open"` maps to `{ "trigger": "always", "conversation": "channel" }` for compatibility; no-mention auto-threading requires explicit object form.
-- `true` maps to conservative mention-triggered behavior.
-- `false`, `"off"`, `"never"`, and `"disabled"` disable the channel.
-
-Default policy semantics are intentionally conservative:
-
-- missing, null, or empty `allowed_channels` allows guild messages but treats top-level messages as mention-triggered and keeps conversations in the top-level channel;
-- legacy allowlist entries are also mention-triggered, but preserve the historical `auto_thread_on_mention` placement behavior.
-
-The asymmetry is deliberate: an unconstrained empty config should not unexpectedly create threads, while legacy configs should keep their prior thread-on-mention behavior.
-
-For `conversation: "channel"`, Discordian auto-creates a top-level channel route when `agent_id` is configured. For `conversation: "thread"`, Discordian reuses the existing exact thread route creation/migration path.
-
-Existing thread messages under an allowed parent channel use permissive route repair. If the exact `(accountId, chatId: threadId, threadId)` route is missing, Discordian creates or migrates it before forwarding the message. This intentionally keeps externally-created Discord/Needle threads working without manual route edits. Reaction events currently follow the same parent-channel allow/deny gate for thread messages; `conversation: "channel"` does not suppress reactions in existing threads.
+For `conversation: "channel"`, Discordian auto-creates a top-level channel route when `agent_id` is configured. For `conversation: "thread"`, Discordian reuses the exact thread route creation/migration path. Existing thread messages under a parent channel use route repair so externally-created Discord/Needle threads continue working without manual route edits. Reaction events follow the same effective parent-channel config for thread messages.
 
 ## Operational note: duplicate listeners
 
@@ -380,24 +344,22 @@ Kill duplicate listeners and restart exactly one if duplicates appear.
 
 ## First-class per-channel config
 
-Discordian now prefers `config.channels` for per-channel guild behavior. `allowed_channels` is deprecated and remains only as a compatibility fallback for older configs; new configs should not use it.
-
 `channels` entries can override account-level bot participation and lifecycle acknowledgement defaults:
 
 ```json
 {
+  "auto_thread_on_mention": true,
   "respond_to_bots": false,
   "allowed_bot_ids": [],
   "acknowledge_message_reaction": false,
   "channels": {
     "HUMAN_CHANNEL": {
       "enabled": true,
-      "trigger": "mention",
-      "conversation": "channel"
+      "trigger": "mention"
     },
     "NEEDLE_CHANNEL": {
       "enabled": true,
-      "trigger": "always",
+      "trigger": "mention",
       "conversation": "thread",
       "respond_to_bots": true,
       "allowed_bot_ids": ["NEEDLE_BOT_USER_ID"]
@@ -408,10 +370,10 @@ Discordian now prefers `config.channels` for per-channel guild behavior. `allowe
 
 Resolution rules:
 
-- `channels` wins over `allowed_channels` when both define the same channel or `*` fallback.
-- If no `channels` entry matches, Discordian falls back to deprecated `allowed_channels` legacy behavior for compatibility.
+- Exact channel entries win over `"*"`; `"*"` wins over account/global defaults.
+- If no channel entry matches and no wildcard exists, Discordian uses account/global defaults.
 - Channel `respond_to_bots`, `allowed_bot_ids`, and `acknowledge_message_reaction` override account defaults only for that channel.
 - Optional `comment` and `channel_name` fields are inert metadata for human operators editing `accounts.json`; the channel ID key remains authoritative.
 - Discordian's own bot user is always ignored globally and cannot be enabled by channel config.
-- Guild sender bot filtering now happens after resolving effective channel config, so a Needle/integration channel can allow bot messages without allowing bots everywhere.
+- Guild sender bot filtering happens after resolving effective channel config, so a Needle/integration channel can allow bot messages without allowing bots everywhere.
 - DM authorization continues to use account-level Discordian DM config.

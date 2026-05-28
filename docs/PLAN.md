@@ -864,3 +864,72 @@ Open design questions:
 - How would this interact with existing `conversation: "thread"` auto-threading and route repair?
 
 Decision for now: table this as a roadmap/future enhancement. Current refactor remains focused on first-class per-channel config, per-channel bot policy, and existing channel/thread placement behavior.
+
+## Cleanup plan: simplify channel config before public release
+
+Goal: remove unnecessary legacy channel-config support while keeping useful account/global defaults. This project is still private/new, so we can simplify the public config surface before open-sourcing it for the Letta community.
+
+Desired config model:
+
+- `config.channels` is an override map, not an allowlist.
+- Effective channel config resolution precedence is:
+  1. exact channel entry: `channels[gateChannelId]`;
+  2. wildcard entry: `channels["*"]`;
+  3. account/global defaults.
+- For thread messages, `gateChannelId` is the parent channel id when available; otherwise it is the message channel id.
+- Missing channel entries are allowed and use account defaults.
+- `enabled: false` or `trigger: "never"` explicitly disables a channel or wildcard/default override.
+
+Keep these account/global defaults:
+
+```json
+{
+  "auto_thread_on_mention": true,
+  "respond_to_bots": false,
+  "allowed_bot_ids": [],
+  "acknowledge_message_reaction": false
+}
+```
+
+Default resolution:
+
+```ts
+const entry = channels[gateChannelId] ?? channels["*"] ?? {};
+
+const trigger = entry.trigger ?? "mention";
+const conversation = entry.conversation
+  ?? (trigger === "mention" && autoThreadOnMention !== false
+    ? "thread"
+    : "channel");
+const respondToBots = entry.respond_to_bots ?? account.respond_to_bots ?? false;
+const allowedBotIds = entry.allowed_bot_ids ?? account.allowed_bot_ids ?? [];
+const acknowledgeMessageReaction =
+  entry.acknowledge_message_reaction
+  ?? account.acknowledge_message_reaction
+  ?? false;
+```
+
+Remove these legacy config surfaces from runtime support and public docs:
+
+- `allowed_channels` / `allowedChannels`;
+- legacy string modes under `allowed_channels` (`"open"`, `"mention"`, `"mention-only"`, etc.);
+- array allowlist behavior under `allowed_channels`;
+- boolean channel policies;
+- old `{ trigger, conversation }` policy objects under `allowed_channels`;
+- `thread_policy_by_channel` / `threadPolicyByChannel`, assuming no remaining runtime dependency.
+
+Keep:
+
+- `auto_thread_on_mention` as an account/global default that channel entries can inherit;
+- `channels` exact entries and optional `channels["*"]`;
+- per-channel `enabled`, `trigger`, `conversation`, `respond_to_bots`, `allowed_bot_ids`, and `acknowledge_message_reaction`;
+- optional inert `comment` and `channel_name` metadata.
+
+Implementation steps:
+
+1. Simplify `channel-gating.ts` to resolve only first-class `channels` plus global defaults.
+2. Remove `allowedChannels` and `threadPolicyByChannel` normalization from `plugin.ts`.
+3. Stop passing `allowedChannels` from `adapter.ts`.
+4. Remove obsolete compatibility wrappers/helpers if no code uses them.
+5. Remove legacy/deprecated config references from README, example config, and implementation notes; keep old history in `docs/PLAN.md` only as historical context.
+6. Rebuild `plugin.mjs`, run syntax/diff checks, redeploy, and re-run the three-channel smoke matrix.

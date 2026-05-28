@@ -98,11 +98,11 @@ Per-channel guild behavior is configured with `config.channels`. The preferred f
 - `channel` keeps the agent conversation in the top-level Discord channel.
 - `thread` creates or uses a Discord thread and routes replies there.
 
-Account-level `respond_to_bots`, `allowed_bot_ids`, and `acknowledge_message_reaction` are defaults. A channel entry may override them. Discordian always ignores its own bot user, even if a channel allows bots.
+Account-level `auto_thread_on_mention`, `respond_to_bots`, `allowed_bot_ids`, and `acknowledge_message_reaction` are defaults. A channel entry may override bot and lifecycle defaults directly. `conversation` is optional; when omitted, mention-triggered channels inherit `auto_thread_on_mention` (`true` means `thread`, `false` means `channel`), while non-mention triggers default to `channel`.
+
+Channel resolution uses: exact channel entry → `"*"` wildcard entry → account/global defaults. `channels` is an override map, not an allowlist: unlisted channels still use the global defaults. Use `enabled: false` or `trigger: "never"` to explicitly disable a channel. Discordian always ignores its own bot user, even if a channel allows bots.
 
 `comment` and `channel_name` are optional human-readable metadata fields for easier manual inspection of `accounts.json`. Discordian ignores them; the channel ID key remains authoritative.
-
-`allowed_channels` is deprecated and supported only as a legacy compatibility fallback for older `accounts.json` files. New configs should use `channels`. Empty/missing `channels` and `allowed_channels` is conservative: guild messages are allowed but top-level messages require a mention and stay in the channel. Legacy array entries and `"mention"` / `"mention-only"` remain mention-triggered, with placement derived from `auto_thread_on_mention`. Legacy `"open"` means no mention required in the top-level channel; use explicit `{ "trigger": "always", "conversation": "thread" }` under `channels` for no-mention auto-threading. If both `channels` and `allowed_channels` define the same channel, `channels` wins.
 
 For existing Discord threads under allowed parent channels, Discordian performs route repair: it creates or migrates the exact thread route needed by Letta's generic custom-channel registry before forwarding the inbound message. This keeps externally-created threads working without manual `routing.yaml` edits.
 

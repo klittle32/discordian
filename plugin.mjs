@@ -34,14 +34,14 @@ import { basename, dirname as dirname2, join as join3 } from "node:path";
 function resolveGateChannelId(channelId, parentChannelId, isThread) {
   return isThread ? parentChannelId ?? channelId : channelId;
 }
-function isLegacyStringArray(allowedChannels) {
-  return Array.isArray(allowedChannels);
-}
 function isChannelMap(value) {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
 function defaultMentionConversation(autoThreadOnMention) {
   return autoThreadOnMention === false ? "channel" : "thread";
+}
+function defaultConversation(trigger, autoThreadOnMention) {
+  return trigger === "mention" ? defaultMentionConversation(autoThreadOnMention) : "channel";
 }
 function isTrigger(value) {
   return value === "mention" || value === "always" || value === "never";
@@ -55,107 +55,28 @@ function isBoolean(value) {
 function normalizedStringList(value) {
   return Array.isArray(value) ? value.filter((item) => typeof item === "string" && item.trim().length > 0) : [];
 }
-function normalizeStringPolicy(value, autoThreadOnMention) {
-  switch (value) {
-    case "open":
-    case "always":
-      return { allowed: true, trigger: "always", conversation: "channel" };
-    case "mention":
-    case "mention-only":
-      return {
-        allowed: true,
-        trigger: "mention",
-        conversation: defaultMentionConversation(autoThreadOnMention)
-      };
-    case "off":
-    case "never":
-    case "disabled":
-      return { allowed: false, trigger: "never", conversation: "channel" };
-    default:
-      return { allowed: false, trigger: "never", conversation: "channel" };
-  }
+function resolveChannelEntry(channels, gateChannelId) {
+  if (!isChannelMap(channels))
+    return {};
+  const exact = channels[gateChannelId];
+  if (isChannelMap(exact))
+    return exact;
+  const wildcard = channels["*"];
+  if (isChannelMap(wildcard))
+    return wildcard;
+  return {};
 }
-function normalizeLegacyChannelPolicy(value, autoThreadOnMention) {
-  if (typeof value === "string") {
-    return normalizeStringPolicy(value, autoThreadOnMention);
-  }
-  if (value === true) {
-    return {
-      allowed: true,
-      trigger: "mention",
-      conversation: defaultMentionConversation(autoThreadOnMention)
-    };
-  }
-  if (value === false || value == null) {
+function resolveChannelPolicy(entry, autoThreadOnMention) {
+  if (entry.enabled === false) {
     return { allowed: false, trigger: "never", conversation: "channel" };
   }
-  if (isChannelMap(value)) {
-    const trigger = isTrigger(value.trigger) ? value.trigger : "mention";
-    const conversation = isConversation(value.conversation) ? value.conversation : defaultMentionConversation(autoThreadOnMention);
-    return {
-      allowed: trigger !== "never",
-      trigger,
-      conversation
-    };
-  }
-  return { allowed: false, trigger: "never", conversation: "channel" };
-}
-function normalizeFirstClassChannelPolicy(value, autoThreadOnMention) {
-  if (!isChannelMap(value)) {
-    return normalizeLegacyChannelPolicy(value, autoThreadOnMention);
-  }
-  if (value.enabled === false) {
-    return { allowed: false, trigger: "never", conversation: "channel" };
-  }
-  const trigger = isTrigger(value.trigger) ? value.trigger : "mention";
-  const conversation = isConversation(value.conversation) ? value.conversation : defaultMentionConversation(autoThreadOnMention);
+  const trigger = isTrigger(entry.trigger) ? entry.trigger : "mention";
+  const conversation = isConversation(entry.conversation) ? entry.conversation : defaultConversation(trigger, autoThreadOnMention);
   return {
     allowed: trigger !== "never",
     trigger,
     conversation
   };
-}
-function resolveChannelEntry(channels, gateChannelId) {
-  if (!isChannelMap(channels))
-    return;
-  if (gateChannelId in channels)
-    return channels[gateChannelId];
-  if ("*" in channels)
-    return channels["*"];
-  return;
-}
-function resolveLegacyPolicy(options) {
-  const { gateChannelId, allowedChannels, autoThreadOnMention } = options;
-  if (!allowedChannels) {
-    return { allowed: true, trigger: "mention", conversation: "channel" };
-  }
-  if (isLegacyStringArray(allowedChannels)) {
-    if (allowedChannels.length === 0) {
-      return { allowed: true, trigger: "mention", conversation: "channel" };
-    }
-    if (!allowedChannels.includes(gateChannelId)) {
-      return { allowed: false, trigger: "never", conversation: "channel" };
-    }
-    return {
-      allowed: true,
-      trigger: "mention",
-      conversation: defaultMentionConversation(autoThreadOnMention)
-    };
-  }
-  if (isChannelMap(allowedChannels)) {
-    const keys = Object.keys(allowedChannels);
-    if (keys.length === 0) {
-      return { allowed: true, trigger: "mention", conversation: "channel" };
-    }
-    if (gateChannelId in allowedChannels) {
-      return normalizeLegacyChannelPolicy(allowedChannels[gateChannelId], autoThreadOnMention);
-    }
-    if ("*" in allowedChannels) {
-      return normalizeLegacyChannelPolicy(allowedChannels["*"], autoThreadOnMention);
-    }
-    return { allowed: false, trigger: "never", conversation: "channel" };
-  }
-  return { allowed: true, trigger: "mention", conversation: "channel" };
 }
 function resolveDiscordianEffectiveChannelConfig(params) {
   const {
@@ -163,7 +84,6 @@ function resolveDiscordianEffectiveChannelConfig(params) {
     parentChannelId,
     isThread,
     channels,
-    allowedChannels,
     autoThreadOnMention,
     respondToBots,
     allowedBotIds,
@@ -171,17 +91,12 @@ function resolveDiscordianEffectiveChannelConfig(params) {
   } = params;
   const gateChannelId = resolveGateChannelId(channelId, parentChannelId, isThread);
   const channelEntry = resolveChannelEntry(channels, gateChannelId);
-  const policy = channelEntry !== undefined ? normalizeFirstClassChannelPolicy(channelEntry, autoThreadOnMention) : resolveLegacyPolicy({
-    gateChannelId,
-    allowedChannels,
-    autoThreadOnMention
-  });
-  const channelRecord = isChannelMap(channelEntry) ? channelEntry : undefined;
+  const policy = resolveChannelPolicy(channelEntry, autoThreadOnMention);
   return {
     ...policy,
-    respondToBots: isBoolean(channelRecord?.respond_to_bots) ? channelRecord.respond_to_bots : respondToBots === true,
-    allowedBotIds: Array.isArray(channelRecord?.allowed_bot_ids) ? normalizedStringList(channelRecord.allowed_bot_ids) : normalizedStringList(allowedBotIds),
-    acknowledgeMessageReaction: isBoolean(channelRecord?.acknowledge_message_reaction) ? channelRecord.acknowledge_message_reaction : acknowledgeMessageReaction === true
+    respondToBots: isBoolean(channelEntry.respond_to_bots) ? channelEntry.respond_to_bots : respondToBots === true,
+    allowedBotIds: Array.isArray(channelEntry.allowed_bot_ids) ? normalizedStringList(channelEntry.allowed_bot_ids) : normalizedStringList(allowedBotIds),
+    acknowledgeMessageReaction: isBoolean(channelEntry.acknowledge_message_reaction) ? channelEntry.acknowledge_message_reaction : acknowledgeMessageReaction === true
   };
 }
 
@@ -932,7 +847,6 @@ function createDiscordAdapter(config) {
           parentChannelId,
           isThread,
           channels: config.channels,
-          allowedChannels: config.allowedChannels,
           autoThreadOnMention: config.autoThreadOnMention,
           respondToBots: config.respondToBots,
           allowedBotIds: config.allowedBotIds,
@@ -1029,7 +943,6 @@ function createDiscordAdapter(config) {
             parentChannelId: msg.channel.parentId ?? null,
             isThread: true,
             channels: config.channels,
-            allowedChannels: config.allowedChannels,
             autoThreadOnMention: config.autoThreadOnMention,
             respondToBots: config.respondToBots,
             allowedBotIds: config.allowedBotIds,
@@ -1352,9 +1265,7 @@ function normalizeAccount(account) {
     dmPolicy: "open",
     allowedUsers: [],
     channels: readConfig(account, "channels", readConfig(account, "channels", undefined)),
-    allowedChannels: readConfig(account, "allowedChannels", readConfig(account, "allowed_channels", undefined)),
     autoThreadOnMention: readConfig(account, "autoThreadOnMention", readConfig(account, "auto_thread_on_mention", true)),
-    threadPolicyByChannel: readConfig(account, "threadPolicyByChannel", readConfig(account, "thread_policy_by_channel", undefined)),
     inboundDebounceMs: readConfig(account, "inboundDebounceMs", readConfig(account, "inbound_debounce_ms", undefined)),
     acknowledgeMessageReaction: readConfig(account, "acknowledgeMessageReaction", readConfig(account, "acknowledge_message_reaction", false)),
     removeStaleRoutes: readConfig(account, "removeStaleRoutes", readConfig(account, "remove_stale_routes", false)),

@@ -12,7 +12,6 @@
         "agent_id": null,
         "default_permission_mode": "standard",
         "auto_thread_on_mention": true,
-        "thread_policy_by_channel": {},
         "acknowledge_message_reaction": false,
         "remove_stale_routes": false,
         "inbound_debounce_ms": 0,
