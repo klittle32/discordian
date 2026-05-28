@@ -342,10 +342,13 @@ node --check plugin.mjs
 
 During live testing, run only one listener process for a Discord bot/account. Multiple `letta server --channels discordian` processes will each receive the same Discord event and can cause duplicate deliveries.
 
+## License
+
+MIT License. See [LICENSE](LICENSE).
+
 ## Publication checklist
 
 Before publishing or accepting contributions:
 
 - Confirm `accounts.json`, `routing.yaml`, `pairing.yaml`, local logs, and transcript files are not tracked.
 - Rotate any credentials that were ever committed or pasted into local logs.
-- Choose and add a license if this repository should permit public reuse.
