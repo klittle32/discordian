@@ -588,3 +588,225 @@ Current validation state: ready to commit after final diff review.
 - Mention inside an existing Discordian-created thread routed through the existing thread route without creating a nested thread.
   - message id: `1509538042665373797`
   - thread id: `1509537840214839438`
+
+## Next enhancement: first-class per-channel config
+
+Goal: promote Discordian's per-channel behavior from an `allowed_channels` policy map into a first-class `channels` config model with account-level defaults and channel-level overrides.
+
+The previous change added per-channel `trigger` and `conversation` under `allowed_channels`. That works, but the broader model should let each Discord channel decide more than just routing. In particular, bot participation is channel-specific: normal human channels should often ignore bots, while integration channels may need to accept messages from Needle or other specific bots.
+
+### Desired config model
+
+Preferred future shape under each account's `config`:
+
+```json
+{
+  "respond_to_bots": false,
+  "allowed_bot_ids": [],
+  "acknowledge_message_reaction": false,
+  "allowed_channels": [],
+  "channels": {
+    "HUMAN_SUPPORT_CHANNEL_ID": {
+      "enabled": true,
+      "trigger": "mention",
+      "conversation": "channel"
+    },
+    "NEEDLE_TRIAGE_CHANNEL_ID": {
+      "enabled": true,
+      "trigger": "always",
+      "conversation": "thread",
+      "respond_to_bots": true,
+      "allowed_bot_ids": ["NEEDLE_BOT_USER_ID"]
+    },
+    "BOT_LAB_CHANNEL_ID": {
+      "enabled": true,
+      "trigger": "always",
+      "conversation": "thread",
+      "respond_to_bots": true,
+      "allowed_bot_ids": [],
+      "acknowledge_message_reaction": true
+    }
+  }
+}
+```
+
+`channels` is the preferred first-class model. `allowed_channels` remains supported as a legacy/compatibility input.
+
+### Account defaults vs per-channel overrides
+
+Account-level config provides defaults:
+
+- `respond_to_bots`
+- `allowed_bot_ids`
+- `acknowledge_message_reaction`
+- existing DM-only policy fields such as `dm_policy` and `allowed_users`
+
+Per-channel config may override:
+
+- `enabled`
+- `trigger`
+- `conversation`
+- `respond_to_bots`
+- `allowed_bot_ids`
+- `acknowledge_message_reaction`
+
+Effective inheritance rules:
+
+```ts
+effective.respondToBots =
+  channel.respond_to_bots ?? account.respond_to_bots ?? false;
+
+effective.allowedBotIds =
+  channel.allowed_bot_ids ?? account.allowed_bot_ids ?? [];
+
+effective.acknowledgeMessageReaction =
+  channel.acknowledge_message_reaction ??
+  account.acknowledge_message_reaction ??
+  false;
+```
+
+Discordian's own bot user is always ignored globally. No per-channel override should allow self-loops.
+
+### Bot authorization semantics
+
+For a guild/channel message after resolving its effective channel config:
+
+1. Human users are allowed if the channel config allows the channel and the message satisfies `trigger` rules.
+2. Bot users are always ignored when the bot user is Discordian itself.
+3. Other bot users are ignored unless `effective.respondToBots === true`.
+4. If `effective.respondToBots === true` and `effective.allowedBotIds` is empty, allow any non-self bot.
+5. If `effective.respondToBots === true` and `effective.allowedBotIds` contains IDs, allow only those bot user IDs.
+
+This permits useful channel-specific patterns:
+
+- normal support channels ignore all bots;
+- Needle integration channels accept only Needle;
+- bot lab/test channels accept any non-self bot.
+
+### Trigger and conversation semantics
+
+Preserve the existing policy behavior:
+
+- `trigger: "mention"` means top-level channel messages require a Discordian bot mention;
+- `trigger: "always"` means authorized top-level messages do not require a mention;
+- `trigger: "never"` or `enabled: false` disables the channel;
+- `conversation: "channel"` keeps replies in the top-level channel;
+- `conversation: "thread"` creates/uses a Discord thread and routes replies there.
+
+Thread messages under an allowed parent channel continue to route through existing/permissive route repair and should not create nested threads.
+
+### Backward compatibility
+
+Keep all existing config forms working:
+
+- `allowed_channels: []` or missing: conservative default, allowed but mention-triggered and channel conversation;
+- `allowed_channels: ["CHANNEL_ID"]`: legacy allowlist, mention-triggered, placement derived from `auto_thread_on_mention`;
+- `allowed_channels` object with string/boolean modes: preserve current mappings;
+- `allowed_channels` object with `{ trigger, conversation }`: preserve current behavior;
+- `auto_thread_on_mention` and `thread_policy_by_channel`: legacy inputs only, used to derive defaults for old config forms.
+
+When both `channels` and `allowed_channels` mention the same channel, `channels` wins. `allowed_channels` acts as compatibility fallback only.
+
+### Proposed internal model
+
+Add a richer effective config type, replacing the current narrow policy shape at adapter call sites:
+
+```ts
+type DiscordianChannelTrigger = "mention" | "always" | "never";
+type DiscordianConversationPlacement = "channel" | "thread";
+
+interface DiscordianEffectiveChannelConfig {
+  allowed: boolean;
+  trigger: DiscordianChannelTrigger;
+  conversation: DiscordianConversationPlacement;
+  respondToBots: boolean;
+  allowedBotIds: string[];
+  acknowledgeMessageReaction: boolean;
+}
+```
+
+The resolver should accept both account defaults and channel-specific maps:
+
+```ts
+function resolveDiscordianEffectiveChannelConfig(options: {
+  channelId: string;
+  parentChannelId?: string | null;
+  isThread: boolean;
+  channels?: unknown;
+  allowedChannels?: unknown;
+  autoThreadOnMention?: boolean;
+  respondToBots?: boolean;
+  allowedBotIds?: unknown;
+  acknowledgeMessageReaction?: boolean;
+}): DiscordianEffectiveChannelConfig;
+```
+
+`resolveDiscordianChannelPolicy(...)` can remain as a compatibility wrapper that calls the richer resolver and returns only `{ allowed, trigger, conversation }`.
+
+### Adapter flow changes
+
+Current sender processing applies global `respondToBots` before guild channel policy is fully resolved. The refactor should split sender processing by chat type:
+
+1. Ignore self immediately for all messages/reactions.
+2. For DMs:
+   - continue using account-level DM policy;
+   - apply account-level bot policy if DMs from bots are ever relevant.
+3. For guild/channel messages:
+   - compute `parentChannelId`, `isThread`, and effective channel config first;
+   - reject disabled/disallowed channels;
+   - apply effective channel bot policy;
+   - apply trigger rules for top-level messages;
+   - create channel/thread routes as today;
+   - include effective flags in the inbound source where needed.
+4. For reactions:
+   - compute effective channel config using the parent channel for thread messages;
+   - apply effective bot policy;
+   - use `effective.acknowledgeMessageReaction` / reaction policy where relevant.
+
+### Implementation plan
+
+1. Extend account normalization in `plugin.ts`.
+   - Read nested `config.channels` into `config.channels`.
+   - Keep existing `allowed_channels`, `respond_to_bots`, `allowed_bot_ids`, and `acknowledge_message_reaction` fields.
+
+2. Extend `channel-gating.ts`.
+   - Define `DiscordianEffectiveChannelConfig`.
+   - Add helpers to normalize string lists and booleans safely.
+   - Add `resolveDiscordianEffectiveChannelConfig(...)`.
+   - Preserve `resolveDiscordianChannelPolicy(...)` and `isDiscordGuildChannelAllowed(...)` as wrappers for compatibility.
+   - Ensure `channels` overrides `allowed_channels` for the same channel.
+
+3. Refactor adapter guild message flow.
+   - Resolve effective config before guild sender bot filtering.
+   - Replace global `respondToBots` use for guild messages with effective channel bot policy.
+   - Keep DM handling behavior unchanged except for any necessary helper extraction.
+
+4. Refactor reaction flow.
+   - Resolve effective config for thread reactions.
+   - Apply effective bot policy.
+   - Decide whether per-channel `acknowledge_message_reaction` affects reaction notifications, lifecycle acks, or both; document the chosen semantics.
+
+5. Update examples and docs.
+   - `accounts.example.json` should show `channels` as preferred.
+   - README should describe account defaults + channel overrides.
+   - Implementation notes should mark `allowed_channels` as legacy-compatible.
+
+6. Add lightweight tests if practical.
+   - Test effective config resolution for:
+     - account defaults only;
+     - channel overrides;
+     - bot whitelist inheritance;
+     - `channels` winning over `allowed_channels`;
+     - legacy allowed-channel forms.
+
+7. Rebuild and live-test.
+   - Rebuild `plugin.mjs`.
+   - Deploy/reinstall/restart one listener.
+   - Smoke test:
+     - human no-tag auto-thread channel;
+     - Needle/bot-allowed channel if available;
+     - bot-disallowed channel if available;
+     - existing thread message;
+     - reactions if possible.
+
+8. Commit after validation.
