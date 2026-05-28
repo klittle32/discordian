@@ -57,6 +57,19 @@ letta channels pair \
 
 Discordian keeps the generic custom-channel registry open and applies Discord-aware policy inside the adapter. In `accounts.json`, leave top-level `dmPolicy` / `allowedUsers` open unless you deliberately want generic custom-channel filtering; use nested `config.dm_policy` and `config.allowed_users` for Discord DM authorization.
 
+DMs require the Discord bot to have the **Direct Messages** gateway intent enabled in the Discord Developer Portal and `GatewayIntentBits.DirectMessages` in the adapter. Discordian's default DM policy is `allowlist`, so add the human Discord user id under nested `config.allowed_users`, or set nested `config.dm_policy` to `open` if any DM sender should be allowed. Authorized DM chats create their own Letta conversation route automatically before the first DM is forwarded. Fresh DM route creation uses the same Letta API credential as channel/thread route creation (`DISCORDIAN_LETTA_API_KEY` or nested `config.discordian_letta_api_key`).
+
+```json
+{
+  "dmPolicy": "open",
+  "allowedUsers": [],
+  "config": {
+    "dm_policy": "allowlist",
+    "allowed_users": ["YOUR_DISCORD_USER_ID"]
+  }
+}
+```
+
 Per-channel guild behavior is configured with `config.channels`. The preferred form separates **trigger** policy, **conversation** placement, and per-channel bot participation:
 
 ```json

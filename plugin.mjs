@@ -274,6 +274,9 @@ function buildDiscordianConversationSummary(input) {
   if (input.chatKind === "thread") {
     return input.parentChannelId ? `Discordian thread ${input.discordChatId} in channel ${input.parentChannelId}` : `Discordian thread ${input.discordChatId}`;
   }
+  if (input.chatKind === "direct") {
+    return `Discordian DM ${input.discordChatId}`;
+  }
   return `Discordian channel ${input.discordChatId}`;
 }
 function asErrorMessage(error) {
@@ -890,6 +893,54 @@ function createDiscordAdapter(config) {
       }));
     });
   }
+  async function ensureDiscordianDirectRoute(chatId) {
+    if (!config.agentId)
+      return;
+    const lockKey = `${config.accountId}:routes`;
+    await runDiscordianRouteLocked(lockKey, async () => {
+      const { routingPath, routes } = await getDiscordianRoutes();
+      const existingRoute = routes.find((route2) => route2.accountId === config.accountId && route2.chatId === chatId && (route2.threadId ?? null) === null && route2.enabled !== false);
+      if (existingRoute)
+        return;
+      let conversationId;
+      try {
+        conversationId = await createDiscordianConversationRouteTarget({
+          agentId: config.agentId,
+          chatKind: "direct",
+          discordChatId: chatId
+        });
+      } catch (error) {
+        console.error("[Discordian] Failed to create DM route conversation", JSON.stringify({
+          accountId: config.accountId,
+          chatId,
+          agentId: config.agentId,
+          baseUrl: normalizeLettaBaseUrl(),
+          error: asErrorMessage(error)
+        }));
+        throw error;
+      }
+      const now = new Date().toISOString();
+      const route = {
+        accountId: config.accountId,
+        chatId,
+        chatType: "direct",
+        threadId: null,
+        agentId: config.agentId,
+        conversationId,
+        enabled: true,
+        createdAt: now,
+        updatedAt: now
+      };
+      routes.push(route);
+      await saveDiscordianRoutes(routingPath, routes);
+      console.log("[Discordian] Created DM route", JSON.stringify({
+        accountId: config.accountId,
+        chatId,
+        agentId: route.agentId,
+        conversationId: route.conversationId
+      }));
+    });
+  }
   async function ensureDiscordianThreadRoute(parentChannelId, threadId) {
     if (!config.agentId)
       return;
@@ -1018,6 +1069,7 @@ function createDiscordAdapter(config) {
           }
           if (markIngressMessageSeen(message.id))
             return;
+          await ensureDiscordianDirectRoute(message.channelId);
           const attachments2 = await collectAttachments(message.attachments, message.channelId);
           if (!content && (!attachments2 || attachments2.length === 0))
             return;

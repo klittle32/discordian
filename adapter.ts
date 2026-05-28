@@ -178,7 +178,7 @@ function resolveLettaApiKey(config: Record<string, unknown>): string | null {
 }
 
 function buildDiscordianConversationSummary(input: {
-  chatKind: "channel" | "thread";
+  chatKind: "channel" | "thread" | "direct";
   discordChatId: string;
   parentChannelId?: string | null;
 }): string {
@@ -186,6 +186,9 @@ function buildDiscordianConversationSummary(input: {
     return input.parentChannelId
       ? `Discordian thread ${input.discordChatId} in channel ${input.parentChannelId}`
       : `Discordian thread ${input.discordChatId}`;
+  }
+  if (input.chatKind === "direct") {
+    return `Discordian DM ${input.discordChatId}`;
   }
   return `Discordian channel ${input.discordChatId}`;
 }
@@ -968,7 +971,7 @@ export function createDiscordAdapter(
 
   async function createDiscordianConversationRouteTarget(input: {
     agentId: string;
-    chatKind: "channel" | "thread";
+    chatKind: "channel" | "thread" | "direct";
     discordChatId: string;
     parentChannelId?: string | null;
   }): Promise<string> {
@@ -1070,6 +1073,70 @@ export function createDiscordAdapter(
         JSON.stringify({
           accountId: config.accountId,
           channelId,
+          agentId: route.agentId,
+          conversationId: route.conversationId,
+        }),
+      );
+    });
+  }
+
+  async function ensureDiscordianDirectRoute(chatId: string): Promise<void> {
+    if (!config.agentId) return;
+    // Direct-message chats need a persisted route before the first inbound DM is
+    // forwarded, otherwise the generic custom-channel registry reports that the
+    // chat is not connected to a Letta agent yet.
+    const lockKey = `${config.accountId}:routes`;
+    await runDiscordianRouteLocked(lockKey, async () => {
+      const { routingPath, routes } = await getDiscordianRoutes();
+      const existingRoute = routes.find(
+        (route) =>
+          route.accountId === config.accountId &&
+          route.chatId === chatId &&
+          (route.threadId ?? null) === null &&
+          route.enabled !== false,
+      );
+      if (existingRoute) return;
+
+      let conversationId: string;
+      try {
+        conversationId = await createDiscordianConversationRouteTarget({
+          agentId: config.agentId,
+          chatKind: "direct",
+          discordChatId: chatId,
+        });
+      } catch (error) {
+        console.error(
+          "[Discordian] Failed to create DM route conversation",
+          JSON.stringify({
+            accountId: config.accountId,
+            chatId,
+            agentId: config.agentId,
+            baseUrl: normalizeLettaBaseUrl(),
+            error: asErrorMessage(error),
+          }),
+        );
+        throw error;
+      }
+
+      const now = new Date().toISOString();
+      const route = {
+        accountId: config.accountId,
+        chatId,
+        chatType: "direct",
+        threadId: null,
+        agentId: config.agentId,
+        conversationId,
+        enabled: true,
+        createdAt: now,
+        updatedAt: now,
+      };
+      routes.push(route);
+      await saveDiscordianRoutes(routingPath, routes);
+      console.log(
+        "[Discordian] Created DM route",
+        JSON.stringify({
+          accountId: config.accountId,
+          chatId,
           agentId: route.agentId,
           conversationId: route.conversationId,
         }),
@@ -1248,6 +1315,7 @@ export function createDiscordAdapter(
             return;
           }
           if (markIngressMessageSeen(message.id)) return;
+          await ensureDiscordianDirectRoute(message.channelId);
 
           const attachments = await collectAttachments(
             message.attachments,

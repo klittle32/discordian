@@ -408,3 +408,18 @@ Operational caveats:
 
 - The final Discord typing pulse may linger briefly after Discordian clears its interval because Discord expires typing indicators itself.
 - Duplicate listener processes can each send typing pulses, matching the existing duplicate inbound delivery caveat. Run only one listener per Discord bot/account during live testing.
+
+
+## Discord DM route creation
+
+Discordian handles DM authorization inside the adapter instead of relying on the generic custom-channel `dmPolicy` gate.
+
+Runtime requirements:
+
+- The Discord bot must have the Direct Messages gateway intent enabled in the Discord Developer Portal.
+- The adapter includes `GatewayIntentBits.DirectMessages`.
+- Top-level account `dmPolicy` / `allowedUsers` should remain `open` / `[]` for generic registry compatibility.
+- Nested `config.dm_policy` controls Discordian DM authorization. It defaults to `allowlist`.
+- Nested `config.allowed_users` contains allowed human Discord user ids when `dm_policy` is `allowlist`.
+
+Accepted DM messages now call `ensureDiscordianDirectRoute(chatId)` before forwarding inbound. The route uses `chatType: "direct"`, `threadId: null`, and a fresh Letta conversation created through the public Letta API. This prevents the first authorized DM from failing with the generic “chat is not connected to a Letta agent yet” message.
