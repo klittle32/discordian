@@ -980,3 +980,42 @@ Initial implementation sketch:
 6. Test auto-created threads, manual threads, Needle-created threads, repeated messages in the same thread, and top-level channel routes.
 
 Decision for now: treat this as the next major roadmap item, not part of the current channel-config cleanup.
+
+### Routing decision: one Letta conversation per Discord chat surface
+
+User decision: Discordian should not route all Discord traffic to the configured/default Letta conversation. The default conversation should be treated only as bootstrap/configuration context, not as the runtime destination for every Discord channel/thread.
+
+Desired runtime routing semantics:
+
+- Each Discord thread gets a fresh Letta conversation when Discordian first sees that thread and no route exists yet.
+- Do not seed new thread conversations with other thread history, parent channel history, or other extra context.
+- Treat the first inbound message delivered from that Discord thread as the first message in the fresh Letta conversation.
+- If a thread route already exists, reuse its existing Letta conversation.
+- If a channel's effective `conversation` mode is `"channel"`, the top-level Discord channel itself is one shared Letta conversation.
+- Each top-level Discord channel gets its own Letta conversation, just like each thread does.
+- If a top-level channel route does not already point to a Letta conversation, create a new Letta conversation for that channel instead of routing to the account/default conversation.
+- If a top-level channel route already exists, reuse its existing Letta conversation.
+- Auto-created threads, manually-created Discord threads, and Needle/external integration threads all follow the same per-thread route rule.
+
+Practical route model:
+
+```text
+Discord channel id  -> route(chatId = channel id, threadId = null)      -> one Letta conversation
+Discord thread id   -> route(chatId = thread id, threadId = thread id)   -> one Letta conversation
+```
+
+Important implications:
+
+- Top-level channel context and thread context are isolated from each other by default.
+- Different top-level channels are isolated from each other by default.
+- Different Discord threads are isolated from each other by default.
+- A Discord thread's first delivered message may be a Needle-routed wrapper or a manually-created thread starter; that message becomes the first message in the new Letta conversation.
+- No route should silently fall back to the account/default conversation when a new Discord chat surface is first observed, except as a temporary compatibility behavior before this feature is implemented.
+
+Implementation notes to investigate:
+
+- Find the custom-channel runtime/API path for creating a new Letta conversation for an existing agent.
+- Replace current route-repair behavior that copies `config.conversationId` into new channel/thread routes.
+- Ensure route creation remains idempotent under duplicate Discord events or listener restarts.
+- Preserve existing routes and their conversation ids; do not migrate old routes automatically without an explicit migration decision.
+- Decide how to handle conversation-creation failure: likely send a visible error to the originating Discord surface and avoid creating a broken route.
