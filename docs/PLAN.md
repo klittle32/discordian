@@ -1266,3 +1266,226 @@ Useful log checks:
 - `[Discordian] Created thread route ... conversationId=conv-...`
 - no `conversationId: "default"` in newly-created routes;
 - no accidental parent conversation inheritance for threads.
+
+## Revised spec: public API conversation creation for Discordian custom-channel routes
+
+### Background and verified constraints
+
+Native first-party Discord routing in Letta Code creates fresh conversations without a Discord-account `letta_api_key` because the first-party `ChannelRegistry` owns an authenticated Letta client. Its route creation path calls an internal helper equivalent to:
+
+```ts
+const conversation = await client.conversations.create({
+  agent_id: agentId,
+  isolated_block_labels: [...ISOLATED_BLOCK_LABELS],
+  ...(summary ? { summary } : {}),
+});
+```
+
+Custom channel plugins do not currently receive that helper through the public plugin API. The custom-channel docs also explicitly say plugins needing Slack/Discord-style auto-routing remain first-party/bundled work for now. Therefore Discordian should not import or call Letta Code internals such as `getClient()`, `createConversationForAgent()`, `addRoute()` from the bundled package, or registry singletons. Those are private implementation details and would make Discordian fragile across Letta Code releases.
+
+The pragmatic custom-channel-only path is for Discordian to use the public Letta API from the adapter when it must create a fresh per-chat route. This is a workaround, not the ideal long-term plugin API.
+
+### Decision
+
+Use adapter-side public Letta API calls to create fresh conversations for new Discordian channel/thread routes, while keeping all Letta Code internal calls out of the custom plugin.
+
+This means Discordian acts as a small Letta API client only for route target creation:
+
+1. Determine that a Discord top-level channel or Discord thread needs a new route.
+2. Create a fresh conversation for the configured `agentId` via the public conversations API.
+3. Persist the route with that returned `conversationId`.
+4. Deliver the triggering Discord message as the first user message in that new conversation.
+
+Do not create seed messages or hydrate thread history into the first turn.
+
+### Public API request shape
+
+Match first-party channel semantics as closely as possible. The native path includes `isolated_block_labels`, so Discordian should do the same if the labels can be identified and represented safely.
+
+Planned request:
+
+```http
+POST /v1/conversations/?agent_id=<agent-id>
+Authorization: Bearer <api-key>
+Content-Type: application/json
+```
+
+Body:
+
+```json
+{
+  "summary": "[Discordian] Thread in #channel: preview…",
+  "isolated_block_labels": ["..."]
+}
+```
+
+Implementation notes:
+
+- Re-inspect installed Letta Code for `ISOLATED_BLOCK_LABELS` before finalizing the body.
+- If the labels are stable constants, copy the same label values into Discordian with a comment documenting the native parity reason.
+- If the labels cannot be identified or appear private/unstable, document the omission explicitly and proceed with `summary` only.
+- Never send a user/system seed message while creating the conversation.
+
+### Credential and base URL policy
+
+The public API workaround requires credentials in the listener process. This is the biggest UX downside versus native Discord.
+
+Resolution order:
+
+1. `LETTA_API_KEY` environment variable.
+2. Optional `account.config.letta_api_key` / normalized `config.lettaApiKey` fallback.
+
+Base URL resolution order:
+
+1. `account.config.letta_base_url` / normalized `config.lettaBaseUrl` when explicitly set.
+2. `LETTA_BASE_URL` environment variable.
+3. `https://api.letta.com` default.
+
+Documentation should strongly prefer environment variables for secrets. `config.letta_api_key` is an escape hatch for deployments where injecting env vars is inconvenient, not the recommended path.
+
+Do not log API keys. Logs may include:
+
+- base URL origin (not full auth headers),
+- account id,
+- Discord channel/thread id,
+- agent id,
+- returned conversation id,
+- sanitized error messages.
+
+### Auth mismatch risks and mitigations
+
+Adapter-side API credentials can drift from the Letta Code listener session. Failure modes include:
+
+- API key belongs to a different user/workspace than the configured `agentId`.
+- `LETTA_BASE_URL` points at a different server than the running listener expects.
+- Conversation creation succeeds in one backend but delivery later targets a conversation unavailable to the listener.
+
+Mitigations:
+
+1. Make missing credentials a clear setup error; do not silently fall back to `default` or an existing session conversation.
+2. Log the resolved base URL and `agentId` during route creation failures.
+3. If the create-conversation response contains agent/conversation metadata, validate it enough to detect obvious mismatches.
+4. Document that the API key/base URL must target the same Letta backend/account as the listener’s configured `agentId`.
+5. In live testing, verify created route conversation ids can actually receive turns through the listener runtime.
+
+### Route creation behavior
+
+New channel route:
+
+- Existing enabled exact channel route wins; preserve it unchanged.
+- If no route exists, create a fresh conversation for `config.agentId`.
+- Write a route with `chatId = channelId`, `threadId = null`, and the new `conversationId`.
+- Do not use `config.conversationId`, `LETTA_CONVERSATION_ID`, parent route ids, or `"default"` for new routes.
+
+New thread route:
+
+- Existing enabled exact thread route wins; preserve it unchanged.
+- Incomplete legacy route migration may update `threadId` metadata while preserving its existing `conversationId`.
+- If no exact/incomplete route exists, create a fresh conversation for `config.agentId`.
+- Write a route with `chatId = threadId`, `threadId = threadId`, and the new `conversationId`.
+- Do not inherit the parent channel route conversation.
+
+### Idempotency and race handling
+
+A duplicate route race can create orphan conversations. Avoid wrong routing first; minimize orphan creation second.
+
+Required in-process guard:
+
+- Serialize channel route creation by `${accountId}:channel:${channelId}`.
+- Serialize thread route creation by `${accountId}:thread:${threadId}`.
+- Re-read `routing.yaml` and re-check route existence inside the lock immediately before the API call.
+- Write the route only after the conversation creation succeeds.
+
+Known remaining risks:
+
+- Multiple listener processes can still race.
+- Process crash after conversation creation but before route write can orphan a conversation.
+- Duplicate Discord delivery after restart can create another conversation before any route exists.
+
+Accept these for the first pass. Optional future hardening:
+
+- atomic temp-file + rename writes for `routing.yaml`,
+- cross-process file locks,
+- API idempotency keys if the Letta conversations API supports them,
+- durable pending-route markers if orphan minimization becomes important.
+
+### Failure behavior
+
+If conversation creation fails:
+
+- Do not write any route.
+- Do not fall back to `default`, `LETTA_CONVERSATION_ID`, `config.conversationId`, or a parent route.
+- Surface/log a clear error so the Discord user/operator can fix credentials or backend mismatch.
+
+If route write fails after conversation creation:
+
+- Do not attempt to route the message to a different conversation.
+- Log clearly that an orphan conversation may exist.
+- Accept the orphan over risking cross-chat memory contamination.
+
+Recommended Discord-facing message should be concise and operational, for example:
+
+```text
+Discordian could not create a Letta conversation for this chat. Check the listener's LETTA_API_KEY/LETTA_BASE_URL and agent binding, then try again.
+```
+
+### Documentation changes
+
+Update docs to frame the public API call honestly:
+
+- Custom channel plugins do not currently receive native Discord/Slack auto-route capabilities from Letta Code.
+- Discordian uses the public Letta conversations API to create per-channel/per-thread conversations while staying within the public boundary.
+- `LETTA_API_KEY` is preferred for route creation; `config.letta_api_key` is optional fallback only.
+- `LETTA_BASE_URL` / `config.letta_base_url` must match the backend containing the configured `agent_id`.
+- New Discord routes never inherit the bootstrap/default conversation.
+
+`accounts.example.json` should avoid implying config-file API keys are required. Prefer either:
+
+- omit `letta_api_key` from the example and document env vars, or
+- include it commented/documented as optional if JSON-comment-free constraints allow a clear placeholder elsewhere.
+
+### Implementation adjustment from current draft
+
+The current working-tree implementation already moved toward adapter-side public API calls, but should be revised before final commit:
+
+1. Confirm and include native `isolated_block_labels` parity if appropriate.
+2. Prefer environment variables in docs and examples; make config-file API key clearly optional.
+3. Revisit error propagation so missing credentials produce a useful Discord/operator failure rather than a confusing generic delivery failure.
+4. Remove or soften any README language implying `config.letta_api_key` is mandatory.
+5. Keep the removal of first-turn thread history hydration.
+6. Keep route locks and second in-lock route existence checks.
+7. Rebuild `plugin.mjs` after changes.
+
+### Validation plan
+
+Static checks:
+
+1. Rebuild bundled plugin.
+2. `node --check plugin.mjs`.
+3. `git diff --check`.
+4. Validate `accounts.example.json` if touched.
+5. Grep new route creation code for forbidden fallbacks:
+   - `config.conversationId`,
+   - `LETTA_CONVERSATION_ID`,
+   - `"default"`,
+   - parent route `conversationId` inheritance.
+
+Live checks:
+
+1. With valid `LETTA_API_KEY`/`LETTA_BASE_URL`, create a new top-level channel route and verify a fresh `conv-...` is written.
+2. Create a new Discord thread route and verify it gets a different fresh `conv-...` from the parent/top-level channel.
+3. Verify the first delivered message is the triggering Discord message, not injected thread history.
+4. Temporarily remove API credentials and verify route creation fails clearly without writing a fallback route.
+5. Verify an existing route keeps its existing `conversationId`.
+6. Verify config/base-url mismatch failures are diagnosable from logs.
+
+### Long-term upstream improvement
+
+The ideal fix is a public Letta Code custom-channel capability for host-owned route target creation, for example:
+
+```ts
+context.createConversationForAgent({ agentId, summary, isolatedBlockLabels })
+context.addRoute(route)
+```
+
+or a registry-supported custom-channel auto-route declaration. If Letta Code exposes such a public API later, Discordian should remove adapter-side credentials and delegate conversation creation back to the host.
