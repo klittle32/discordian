@@ -9,7 +9,7 @@
       "allowedUsers": [],
       "config": {
         "token": "YOUR_DISCORD_BOT_TOKEN",
-        "agent_id": null,
+        "agent_id": "YOUR_LETTA_AGENT_ID",
         "default_permission_mode": "standard",
         "auto_thread_on_mention": true,
         "acknowledge_message_reaction": false,
@@ -18,33 +18,35 @@
         "transcribe_voice": false,
         "respond_to_bots": false,
         "allowed_bot_ids": [],
-        "dm_policy": "pairing",
-        "allowed_users": [],
+        "dm_policy": "allowlist",
+        "allowed_users": [
+          "YOUR_DISCORD_USER_ID"
+        ],
         "channels": {
-          "DISCORD_CHANNEL_REQUIRES_MENTION_TOP_LEVEL": {
+          "MENTION_CHANNEL_ID": {
             "enabled": true,
             "trigger": "mention",
             "conversation": "channel",
             "comment": "Mention-triggered top-level channel example",
             "channel_name": "#mentions-only"
           },
-          "DISCORD_CHANNEL_AUTO_THREAD": {
+          "AUTO_THREAD_CHANNEL_ID": {
             "enabled": true,
             "trigger": "always",
             "conversation": "thread",
             "comment": "No-mention auto-thread channel example",
-            "channel_name": "#discordian-test"
+            "channel_name": "#assistant"
           },
-          "DISCORD_CHANNEL_NEEDLE_TRIAGE": {
+          "INTEGRATION_CHANNEL_ID": {
             "enabled": true,
             "trigger": "always",
             "conversation": "thread",
             "respond_to_bots": true,
             "allowed_bot_ids": [
-              "NEEDLE_BOT_USER_ID"
+              "INTEGRATION_BOT_USER_ID"
             ],
-            "comment": "Needle integration channel; allows only the Needle bot",
-            "channel_name": "#needle-triage"
+            "comment": "Integration channel that allows a specific bot",
+            "channel_name": "#integration-triage"
           }
         }
       },
