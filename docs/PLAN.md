@@ -1676,3 +1676,198 @@ Only run this if valid credentials/base URL are already available or the user pr
   - possible orphan conversations on crash/race;
   - env/API key must match listener backend.
 - [ ] Ask the user before committing implementation changes.
+
+## Planned enhancement: Discord typing indicator
+
+### Spec reference
+
+See `docs/TYPING_INDICATOR_SPEC.md` for the feature contract, Discord API behavior, lifecycle design, configuration defaults, testing plan, acceptance criteria, and known limitations.
+
+### Objective
+
+Add a Discord-native typing indicator while Discordian is processing an inbound Letta turn. The indicator should use Discord.js `sendTyping()` on the actual reply target (`threadId ?? chatId`), refresh during long turns, and stop by clearing Discordian's interval when the turn completes, errors, cancels, sends output, or the adapter stops.
+
+### Implementation todo plan
+
+#### 1. Confirm current adapter lifecycle and typing insertion points
+
+- [ ] Re-read `adapter.ts` around `handleTurnLifecycleEvent(...)`.
+- [ ] Confirm current behavior:
+  - [ ] `queued` schedules lifecycle reaction transition.
+  - [ ] `processing` currently returns without work.
+  - [ ] terminal events schedule lifecycle reaction transition and error replies.
+- [ ] Re-read `sendMessage(...)` text, file, and reaction paths.
+- [ ] Re-read `stop()` cleanup maps.
+- [ ] Identify all places that should call `clearTypingForChat(...)`.
+
+#### 2. Add constants and config readers
+
+- [ ] Add constants near existing lifecycle constants:
+  - [ ] `DISCORD_TYPING_INDICATOR_DEFAULT = true`.
+  - [ ] `DISCORD_TYPING_REFRESH_MS_DEFAULT = 8_000`.
+  - [ ] `DISCORD_TYPING_MAX_MS_DEFAULT = 10 * 60 * 1000`.
+  - [ ] safe min/max constants for refresh and max duration.
+- [ ] Add helpers to read boolean config from `config.typingIndicator` / `config.typing_indicator`.
+- [ ] Add helpers to read numeric milliseconds config from:
+  - [ ] `typingIndicatorRefreshMs` / `typing_indicator_refresh_ms`.
+  - [ ] `typingIndicatorMaxMs` / `typing_indicator_max_ms`.
+- [ ] Clamp invalid/out-of-range values to defaults or safe bounds.
+- [ ] Avoid making config required.
+- [ ] Ensure no per-account secret or unrelated config behavior changes.
+
+#### 3. Add typing-support types and guards
+
+- [ ] Add `DiscordTypingTargetId` and `DiscordTypingSourceKey` aliases.
+- [ ] Add `DiscordTypingState` interface with `sourceKeys`, `timer`, and `timeout`.
+- [ ] Add a narrow `isDiscordTypingChannel(channel)` guard checking for `sendTyping`.
+- [ ] Confirm the guard works for normal text channels and thread channels.
+- [ ] Do not loosen existing sendable-channel checks for actual message sends.
+
+#### 4. Add adapter typing state
+
+- [ ] Add `typingByChatId = new Map<DiscordTypingTargetId, DiscordTypingState>()` beside the existing lifecycle maps.
+- [ ] Ensure state is per adapter/account instance, not module-global.
+- [ ] Keep state in-memory only; do not persist typing state.
+
+#### 5. Add target/source-key helpers
+
+- [ ] Implement `getTypingTargetId(source)`:
+  - [ ] use `source.threadId ?? source.chatId`.
+  - [ ] return `null` for missing/empty target.
+- [ ] Implement `getTypingSourceKey(source)` using stable non-content fields:
+  - [ ] account id,
+  - [ ] channel id/name,
+  - [ ] chat id,
+  - [ ] thread id,
+  - [ ] message id,
+  - [ ] agent id,
+  - [ ] conversation id.
+- [ ] Avoid user text/content in keys or logs.
+- [ ] Make helper tolerant of optional/missing fields.
+
+#### 6. Add send/start/stop/clear typing helpers
+
+- [ ] Implement `sendTypingAction(targetChannelId)`:
+  - [ ] return if not running or no client.
+  - [ ] fetch target channel through Discord client.
+  - [ ] use `isDiscordTypingChannel(...)`.
+  - [ ] call `channel.sendTyping()`.
+  - [ ] catch/log failures as warnings only.
+- [ ] Implement `startTypingForSource(source)`:
+  - [ ] return if typing disabled.
+  - [ ] compute target and source key.
+  - [ ] if an entry already exists for target, add source key and return.
+  - [ ] call `sendTypingAction(...)` immediately.
+  - [ ] create refresh interval.
+  - [ ] create max-duration timeout.
+  - [ ] call `unref?.()` on timers if available.
+  - [ ] store state in `typingByChatId`.
+- [ ] Implement `stopTypingForSource(source)`:
+  - [ ] compute target and source key.
+  - [ ] delete source key from state.
+  - [ ] clear target only when no source keys remain.
+- [ ] Implement `clearTypingForChat(targetChannelId)`:
+  - [ ] clear interval.
+  - [ ] clear timeout.
+  - [ ] delete map entry.
+- [ ] Implement `clearAllTyping()`:
+  - [ ] clear all intervals and timeouts.
+  - [ ] clear map.
+
+#### 7. Wire lifecycle processing events
+
+- [ ] Replace the current no-op `if (event.type === "processing") return;` with start-typing behavior.
+- [ ] For `processing`, start typing for all event sources and return.
+- [ ] For terminal events, stop typing for all event sources.
+- [ ] Ensure terminal stop runs for completed, cancelled, and error.
+- [ ] Ensure typing cleanup is not skipped if lifecycle reaction updates fail.
+- [ ] Preserve all existing lifecycle reaction and lifecycle error reply behavior.
+- [ ] Preserve `queued` behavior unchanged.
+
+#### 8. Wire outbound send cleanup
+
+- [ ] In the file upload path, compute `targetChannelId = msg.threadId ?? msg.chatId` and clear typing before the first `channel.send(...)` or immediately after successful send.
+- [ ] In the text path, compute the same target and clear typing before the first chunk send or immediately after the first successful chunk send.
+- [ ] Decide whether to clear typing on direct replies; likely not required unless direct replies are lifecycle-associated.
+- [ ] Do not clear typing on reaction-only sends unless a test or live behavior shows it is needed.
+
+#### 9. Wire adapter stop cleanup
+
+- [ ] Add `clearAllTyping()` to `stop()`.
+- [ ] Ensure this happens alongside lifecycle map cleanup.
+- [ ] Confirm repeated `stop()` calls remain safe.
+
+#### 10. Add startup/config logging
+
+- [ ] Extend the plugin/account startup log with:
+  - [ ] `typingIndicator`,
+  - [ ] `typingRefreshMs`,
+  - [ ] `typingMaxMs`.
+- [ ] Avoid logging every typing refresh.
+- [ ] Avoid logging secrets or message content.
+
+#### 11. Update docs and examples
+
+- [ ] Update `README.md` account policy section with typing config fields and defaults.
+- [ ] Mention Discord pulse semantics: no explicit stop; final pulse expires naturally.
+- [ ] Mention target placement: `threadId ?? chatId`.
+- [ ] Update `docs/IMPLEMENTATION_NOTES.md` with design summary once implemented.
+- [ ] Consider adding optional fields to `accounts.example.json` only if safe and not too noisy; if added, avoid making them look required.
+
+#### 12. Rebuild bundled plugin
+
+- [ ] Run the build command after source edits:
+
+```bash
+bun build plugin.ts --target=node --format=esm --outfile=plugin.mjs --external:discord.js --external:./runtime.mjs --external:./transcription-stub.mjs
+```
+
+- [ ] Confirm `plugin.mjs` includes the generated typing changes.
+
+#### 13. Static validation
+
+- [ ] Run:
+
+```bash
+node --check plugin.mjs
+git diff --check
+python3 -m json.tool accounts.example.json >/dev/null
+```
+
+- [ ] Inspect `git diff --stat`.
+- [ ] Inspect relevant source and docs diffs.
+- [ ] Grep for accidental deprecated APIs:
+
+```bash
+grep -R "startTyping\|stopTyping" -n adapter.ts plugin.ts plugin.mjs docs README.md || true
+```
+
+- [ ] Confirm implementation uses `sendTyping()` only.
+
+#### 14. Manual/local test plan
+
+- [ ] If unit harness exists, add or run focused tests with fake timers.
+- [ ] If no unit harness exists, prepare a small manual fake-channel validation or rely on live Discord test after static validation.
+- [ ] Live test in a top-level channel:
+  - [ ] send a long-running request;
+  - [ ] confirm typing appears in the top-level channel;
+  - [ ] confirm it stops after reply.
+- [ ] Live test in a thread:
+  - [ ] send a long-running request in a Discord thread;
+  - [ ] confirm typing appears in the thread, not parent;
+  - [ ] confirm it stops after reply.
+- [ ] Live test error/cancel path if practical.
+- [ ] Watch listener logs for typing warnings or timer leaks.
+
+#### 15. Final review checklist before commit
+
+- [ ] No secrets in diffs.
+- [ ] Docs match implementation defaults and field names.
+- [ ] `plugin.mjs` rebuilt from `plugin.ts`.
+- [ ] Validation commands pass.
+- [ ] Known limitations documented:
+  - [ ] no explicit Discord stop API;
+  - [ ] last pulse may linger briefly;
+  - [ ] multi-listener duplicate pulse behavior;
+  - [ ] observe-only lifecycle ambiguity if relevant.
+- [ ] Ask before committing unless the user has explicitly requested commit.
