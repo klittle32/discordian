@@ -23,3 +23,6 @@ pnpm-debug.log*
 .DS_Store
 .vscode/
 .idea/
+
+# Local voice transcription artifacts
+*.transcript.txt
