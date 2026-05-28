@@ -1,14 +1,12 @@
 /**
  * Discord guild-channel gating and policy resolution.
  *
- * `allowedChannels` accepts three formats:
+ * Preferred config is `channels`, a first-class per-channel map with account
+ * defaults and channel-level overrides. `allowedChannels` remains supported as
+ * a legacy compatibility input:
  *   - Legacy `string[]`: simple allowlist, entries default to mention-triggered
  *   - Legacy mode map: `Record<channelId, "mention" | "mention-only" | "open" | boolean>`
  *   - Policy map: `Record<channelId, { trigger, conversation }>`
- *
- * The policy map separates two concerns:
- *   - trigger: when a top-level channel message should engage the agent
- *   - conversation: whether the agent conversation happens in-channel or in a thread
  */
 
 export type DiscordianChannelTrigger = "mention" | "always" | "never";
@@ -20,6 +18,13 @@ export interface DiscordianChannelPolicy {
   conversation: DiscordianConversationPlacement;
 }
 
+export interface DiscordianEffectiveChannelConfig
+  extends DiscordianChannelPolicy {
+  respondToBots: boolean;
+  allowedBotIds: string[];
+  acknowledgeMessageReaction: boolean;
+}
+
 export interface DiscordChannelGateParams {
   /** ID of the channel the message arrived in. For thread messages this is the thread's channel ID. */
   channelId: string;
@@ -27,13 +32,22 @@ export interface DiscordChannelGateParams {
   parentChannelId: string | null;
   /** Whether the message is in a thread. */
   isThread: boolean;
-  /** The configured allowlist, mode map, or policy map (may be empty/undefined to mean "no gate"). */
+  /** Preferred first-class per-channel config map. */
+  channels?: unknown;
+  /** Legacy allowlist, mode map, or policy map (may be empty/undefined to mean "no gate"). */
   allowedChannels?: unknown;
 }
 
 export interface DiscordChannelPolicyParams extends DiscordChannelGateParams {
   /** Legacy setting used to map simple mention configs to channel/thread placement. */
   autoThreadOnMention?: boolean;
+}
+
+export interface DiscordEffectiveChannelConfigParams
+  extends DiscordChannelPolicyParams {
+  respondToBots?: boolean;
+  allowedBotIds?: unknown;
+  acknowledgeMessageReaction?: boolean;
 }
 
 /** Resolved channel ID for gating purposes (thread → parent fallback). */
@@ -50,13 +64,9 @@ function isLegacyStringArray(allowedChannels: unknown): allowedChannels is strin
 }
 
 function isChannelMap(
-  allowedChannels: unknown,
-): allowedChannels is Record<string, unknown> {
-  return (
-    !!allowedChannels &&
-    typeof allowedChannels === "object" &&
-    !Array.isArray(allowedChannels)
-  );
+  value: unknown,
+): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
 function defaultMentionConversation(
@@ -73,6 +83,19 @@ function isConversation(
   value: unknown,
 ): value is DiscordianConversationPlacement {
   return value === "channel" || value === "thread";
+}
+
+function isBoolean(value: unknown): value is boolean {
+  return typeof value === "boolean";
+}
+
+function normalizedStringList(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter(
+        (item: unknown): item is string =>
+          typeof item === "string" && item.trim().length > 0,
+      )
+    : [];
 }
 
 function normalizeStringPolicy(
@@ -99,7 +122,7 @@ function normalizeStringPolicy(
   }
 }
 
-function normalizeChannelPolicy(
+function normalizeLegacyChannelPolicy(
   value: unknown,
   autoThreadOnMention?: boolean,
 ): DiscordianChannelPolicy {
@@ -116,11 +139,10 @@ function normalizeChannelPolicy(
   if (value === false || value == null) {
     return { allowed: false, trigger: "never", conversation: "channel" };
   }
-  if (typeof value === "object" && !Array.isArray(value)) {
-    const record = value as Record<string, unknown>;
-    const trigger = isTrigger(record.trigger) ? record.trigger : "mention";
-    const conversation = isConversation(record.conversation)
-      ? record.conversation
+  if (isChannelMap(value)) {
+    const trigger = isTrigger(value.trigger) ? value.trigger : "mention";
+    const conversation = isConversation(value.conversation)
+      ? value.conversation
       : defaultMentionConversation(autoThreadOnMention);
     return {
       allowed: trigger !== "never",
@@ -131,40 +153,49 @@ function normalizeChannelPolicy(
   return { allowed: false, trigger: "never", conversation: "channel" };
 }
 
-/**
- * Returns true when the message should be processed, false when the gate
- * blocks it. Messages outside guilds (DMs) should not be passed through this
- * helper — gate them at the call site by checking chat type first.
- */
-export function isDiscordGuildChannelAllowed(
-  params: DiscordChannelGateParams,
-): boolean {
-  return resolveDiscordianChannelPolicy(params).allowed;
+function normalizeFirstClassChannelPolicy(
+  value: unknown,
+  autoThreadOnMention?: boolean,
+): DiscordianChannelPolicy {
+  if (!isChannelMap(value)) {
+    return normalizeLegacyChannelPolicy(value, autoThreadOnMention);
+  }
+  if (value.enabled === false) {
+    return { allowed: false, trigger: "never", conversation: "channel" };
+  }
+  const trigger = isTrigger(value.trigger) ? value.trigger : "mention";
+  const conversation = isConversation(value.conversation)
+    ? value.conversation
+    : defaultMentionConversation(autoThreadOnMention);
+  return {
+    allowed: trigger !== "never",
+    trigger,
+    conversation,
+  };
 }
 
-/**
- * Resolve the full Discordian per-channel policy.
- */
-export function resolveDiscordianChannelPolicy(
-  params: DiscordChannelPolicyParams,
+function resolveChannelEntry(
+  channels: unknown,
+  gateChannelId: string,
+): unknown {
+  if (!isChannelMap(channels)) return undefined;
+  if (gateChannelId in channels) return channels[gateChannelId];
+  if ("*" in channels) return channels["*"];
+  return undefined;
+}
+
+function resolveLegacyPolicy(
+  options: {
+    gateChannelId: string;
+    allowedChannels?: unknown;
+    autoThreadOnMention?: boolean;
+  },
 ): DiscordianChannelPolicy {
-  const {
-    channelId,
-    parentChannelId,
-    isThread,
-    allowedChannels,
-    autoThreadOnMention,
-  } = params;
+  const { gateChannelId, allowedChannels, autoThreadOnMention } = options;
 
   if (!allowedChannels) {
     return { allowed: true, trigger: "mention", conversation: "channel" };
   }
-
-  const gateChannelId = resolveGateChannelId(
-    channelId,
-    parentChannelId,
-    isThread,
-  );
 
   if (isLegacyStringArray(allowedChannels)) {
     if (allowedChannels.length === 0) {
@@ -186,18 +217,96 @@ export function resolveDiscordianChannelPolicy(
       return { allowed: true, trigger: "mention", conversation: "channel" };
     }
     if (gateChannelId in allowedChannels) {
-      return normalizeChannelPolicy(
+      return normalizeLegacyChannelPolicy(
         allowedChannels[gateChannelId],
         autoThreadOnMention,
       );
     }
     if ("*" in allowedChannels) {
-      return normalizeChannelPolicy(allowedChannels["*"], autoThreadOnMention);
+      return normalizeLegacyChannelPolicy(
+        allowedChannels["*"],
+        autoThreadOnMention,
+      );
     }
     return { allowed: false, trigger: "never", conversation: "channel" };
   }
 
   return { allowed: true, trigger: "mention", conversation: "channel" };
+}
+
+/**
+ * Resolve the effective Discordian per-channel config, including channel-level
+ * overrides for bot participation and lifecycle acknowledgement behavior.
+ */
+export function resolveDiscordianEffectiveChannelConfig(
+  params: DiscordEffectiveChannelConfigParams,
+): DiscordianEffectiveChannelConfig {
+  const {
+    channelId,
+    parentChannelId,
+    isThread,
+    channels,
+    allowedChannels,
+    autoThreadOnMention,
+    respondToBots,
+    allowedBotIds,
+    acknowledgeMessageReaction,
+  } = params;
+  const gateChannelId = resolveGateChannelId(
+    channelId,
+    parentChannelId,
+    isThread,
+  );
+  const channelEntry = resolveChannelEntry(channels, gateChannelId);
+  const policy = channelEntry !== undefined
+    ? normalizeFirstClassChannelPolicy(channelEntry, autoThreadOnMention)
+    : resolveLegacyPolicy({
+        gateChannelId,
+        allowedChannels,
+        autoThreadOnMention,
+      });
+  const channelRecord = isChannelMap(channelEntry) ? channelEntry : undefined;
+
+  return {
+    ...policy,
+    respondToBots: isBoolean(channelRecord?.respond_to_bots)
+      ? channelRecord.respond_to_bots
+      : respondToBots === true,
+    allowedBotIds: Array.isArray(channelRecord?.allowed_bot_ids)
+      ? normalizedStringList(channelRecord.allowed_bot_ids)
+      : normalizedStringList(allowedBotIds),
+    acknowledgeMessageReaction: isBoolean(
+      channelRecord?.acknowledge_message_reaction,
+    )
+      ? channelRecord.acknowledge_message_reaction
+      : acknowledgeMessageReaction === true,
+  };
+}
+
+/**
+ * Returns true when the message should be processed, false when the gate
+ * blocks it. Messages outside guilds (DMs) should not be passed through this
+ * helper — gate them at the call site by checking chat type first.
+ */
+export function isDiscordGuildChannelAllowed(
+  params: DiscordChannelGateParams,
+): boolean {
+  return resolveDiscordianChannelPolicy(params).allowed;
+}
+
+/**
+ * Resolve the Discordian per-channel routing policy. Compatibility wrapper for
+ * older call sites that do not need bot/reaction overrides.
+ */
+export function resolveDiscordianChannelPolicy(
+  params: DiscordChannelPolicyParams,
+): DiscordianChannelPolicy {
+  const effective = resolveDiscordianEffectiveChannelConfig(params);
+  return {
+    allowed: effective.allowed,
+    trigger: effective.trigger,
+    conversation: effective.conversation,
+  };
 }
 
 /**

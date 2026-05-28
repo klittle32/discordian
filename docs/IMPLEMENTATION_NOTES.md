@@ -377,3 +377,41 @@ ps aux | grep 'letta server --debug --env-name discordian-test --channels discor
 ```
 
 Kill duplicate listeners and restart exactly one if duplicates appear.
+
+## First-class per-channel config
+
+Discordian now prefers `config.channels` for per-channel guild behavior. `allowed_channels` is deprecated and remains only as a compatibility fallback for older configs; new configs should not use it.
+
+`channels` entries can override account-level bot participation and lifecycle acknowledgement defaults:
+
+```json
+{
+  "respond_to_bots": false,
+  "allowed_bot_ids": [],
+  "acknowledge_message_reaction": false,
+  "channels": {
+    "HUMAN_CHANNEL": {
+      "enabled": true,
+      "trigger": "mention",
+      "conversation": "channel"
+    },
+    "NEEDLE_CHANNEL": {
+      "enabled": true,
+      "trigger": "always",
+      "conversation": "thread",
+      "respond_to_bots": true,
+      "allowed_bot_ids": ["NEEDLE_BOT_USER_ID"]
+    }
+  }
+}
+```
+
+Resolution rules:
+
+- `channels` wins over `allowed_channels` when both define the same channel or `*` fallback.
+- If no `channels` entry matches, Discordian falls back to deprecated `allowed_channels` legacy behavior for compatibility.
+- Channel `respond_to_bots`, `allowed_bot_ids`, and `acknowledge_message_reaction` override account defaults only for that channel.
+- Optional `comment` and `channel_name` fields are inert metadata for human operators editing `accounts.json`; the channel ID key remains authoritative.
+- Discordian's own bot user is always ignored globally and cannot be enabled by channel config.
+- Guild sender bot filtering now happens after resolving effective channel config, so a Needle/integration channel can allow bot messages without allowing bots everywhere.
+- DM authorization continues to use account-level Discordian DM config.

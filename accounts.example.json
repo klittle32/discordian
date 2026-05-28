@@ -11,20 +11,6 @@
         "token": "YOUR_DISCORD_BOT_TOKEN",
         "agent_id": null,
         "default_permission_mode": "standard",
-        "allowed_channels": {
-          "DISCORD_CHANNEL_REQUIRES_MENTION_TOP_LEVEL": {
-            "trigger": "mention",
-            "conversation": "channel"
-          },
-          "DISCORD_CHANNEL_AUTO_THREAD": {
-            "trigger": "always",
-            "conversation": "thread"
-          },
-          "DISCORD_CHANNEL_MENTION_THREAD": {
-            "trigger": "mention",
-            "conversation": "thread"
-          }
-        },
         "auto_thread_on_mention": true,
         "thread_policy_by_channel": {},
         "acknowledge_message_reaction": false,
@@ -34,7 +20,34 @@
         "respond_to_bots": false,
         "allowed_bot_ids": [],
         "dm_policy": "pairing",
-        "allowed_users": []
+        "allowed_users": [],
+        "channels": {
+          "DISCORD_CHANNEL_REQUIRES_MENTION_TOP_LEVEL": {
+            "enabled": true,
+            "trigger": "mention",
+            "conversation": "channel",
+            "comment": "Mention-triggered top-level channel example",
+            "channel_name": "#mentions-only"
+          },
+          "DISCORD_CHANNEL_AUTO_THREAD": {
+            "enabled": true,
+            "trigger": "always",
+            "conversation": "thread",
+            "comment": "No-mention auto-thread channel example",
+            "channel_name": "#discordian-test"
+          },
+          "DISCORD_CHANNEL_NEEDLE_TRIAGE": {
+            "enabled": true,
+            "trigger": "always",
+            "conversation": "thread",
+            "respond_to_bots": true,
+            "allowed_bot_ids": [
+              "NEEDLE_BOT_USER_ID"
+            ],
+            "comment": "Needle integration channel; allows only the Needle bot",
+            "channel_name": "#needle-triage"
+          }
+        }
       },
       "createdAt": "2026-01-01T00:00:00.000Z",
       "updatedAt": "2026-01-01T00:00:00.000Z"

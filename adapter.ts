@@ -1,8 +1,7 @@
 import { promises as fs } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import {
-  isDiscordGuildChannelAllowed,
-  resolveDiscordianChannelPolicy,
+  resolveDiscordianEffectiveChannelConfig,
 } from "./channel-gating";
 import { formatDiscordDeliveryError } from "./error-reply";
 import {
@@ -399,25 +398,34 @@ export function createDiscordAdapter(
       : [];
   }
 
-  function shouldProcessDiscordSender(
+  function isSelfDiscordUser(user: DiscordUserLike): boolean {
+    return !user.id || user.id === botUserId;
+  }
+
+  function isAllowedBotSender(
     user: DiscordUserLike,
-    chatType: "direct" | "channel",
+    options: { respondToBots?: boolean; allowedBotIds?: unknown },
   ): boolean {
-    if (!user.id) return false;
-    if (user.id === botUserId) return false;
+    if (!user.bot) return true;
+    if (options.respondToBots !== true) return false;
+    const allowedBotIds = normalizedStringList(options.allowedBotIds);
+    if (allowedBotIds.length === 0) return true;
+    return allowedBotIds.includes(user.id);
+  }
+
+  function shouldProcessDiscordDmSender(user: DiscordUserLike): boolean {
+    if (isSelfDiscordUser(user)) return false;
 
     if (user.bot) {
-      if (config.respondToBots !== true) return false;
-      const allowedBotIds = normalizedStringList(config.allowedBotIds);
-      if (allowedBotIds.length === 0) return true;
-      return allowedBotIds.includes(user.id);
+      return isAllowedBotSender(user, {
+        respondToBots: config.respondToBots,
+        allowedBotIds: config.allowedBotIds,
+      });
     }
 
-    if (chatType === "direct") {
-      const discordianDmPolicy = config.discordianDmPolicy ?? config.dmPolicy;
-      if (discordianDmPolicy === "allowlist") {
-        return normalizedStringList(config.discordianAllowedUsers).includes(user.id);
-      }
+    const discordianDmPolicy = config.discordianDmPolicy ?? config.dmPolicy;
+    if (discordianDmPolicy === "allowlist") {
+      return normalizedStringList(config.discordianAllowedUsers).includes(user.id);
     }
 
     return true;
@@ -888,20 +896,20 @@ export function createDiscordAdapter(
         if (!userId) return;
 
         const chatType = resolveDiscordChatType(message.guildId);
-        if (!shouldProcessDiscordSender(message.author, chatType)) {
-          if (chatType === "direct" && !message.author.bot) {
-            await adapter.sendDirectReply(
-              message.channelId,
-              "You are not on the allowed users list for this Discordian bot.",
-            );
-          }
-          return;
-        }
         const isThread = isThreadMessage(message);
         const wasMentioned = chatType === "channel" && hasBotMention(message);
 
         // ── DM handling ──────────────────────────────────────────
         if (chatType === "direct") {
+          if (!shouldProcessDiscordDmSender(message.author)) {
+            if (!message.author.bot) {
+              await adapter.sendDirectReply(
+                message.channelId,
+                "You are not on the allowed users list for this Discordian bot.",
+              );
+            }
+            return;
+          }
           if (markIngressMessageSeen(message.id)) return;
 
           const attachments = await collectAttachments(
@@ -942,14 +950,28 @@ export function createDiscordAdapter(
         // exact thread route exists or can be created.
         const parentChannelId =
           (message.channel as { parentId?: string | null }).parentId ?? null;
-        const channelPolicy = resolveDiscordianChannelPolicy({
+        const channelPolicy = resolveDiscordianEffectiveChannelConfig({
           channelId: message.channelId,
           parentChannelId,
           isThread,
+          channels: config.channels,
           allowedChannels: config.allowedChannels,
           autoThreadOnMention: config.autoThreadOnMention,
+          respondToBots: config.respondToBots,
+          allowedBotIds: config.allowedBotIds,
+          acknowledgeMessageReaction: config.acknowledgeMessageReaction,
         });
         if (!channelPolicy.allowed) return;
+        if (isSelfDiscordUser(message.author)) return;
+        if (
+          message.author.bot &&
+          !isAllowedBotSender(message.author, {
+            respondToBots: channelPolicy.respondToBots,
+            allowedBotIds: channelPolicy.allowedBotIds,
+          })
+        ) {
+          return;
+        }
 
         const shouldTrigger =
           isThread ||
@@ -1036,8 +1058,7 @@ export function createDiscordAdapter(
         action: "added" | "removed",
       ) => {
         if (!adapter.onMessage) return;
-        const reactionChatType = resolveDiscordChatType(reaction.message.guildId);
-        if (!shouldProcessDiscordSender(user, reactionChatType)) return;
+        if (isSelfDiscordUser(user)) return;
 
         try {
           if (reaction.partial) await reaction.fetch();
@@ -1065,19 +1086,40 @@ export function createDiscordAdapter(
         // In guilds, only react on messages in threads we're tracking
         if (chatType === "channel" && !isThread) return;
 
-        // Apply channel allowlist gating in guilds (parent channel of the thread)
-        if (
-          chatType === "channel" &&
-          isThread &&
-          !isDiscordGuildChannelAllowed({
+        let effectiveChannelConfig;
+        if (chatType === "channel" && isThread) {
+          effectiveChannelConfig = resolveDiscordianEffectiveChannelConfig({
             channelId,
             parentChannelId:
               (msg.channel as { parentId?: string | null }).parentId ?? null,
             isThread: true,
+            channels: config.channels,
             allowedChannels: config.allowedChannels,
-          })
-        )
-          return;
+            autoThreadOnMention: config.autoThreadOnMention,
+            respondToBots: config.respondToBots,
+            allowedBotIds: config.allowedBotIds,
+            acknowledgeMessageReaction: config.acknowledgeMessageReaction,
+          });
+          if (!effectiveChannelConfig.allowed) return;
+          if (
+            user.bot &&
+            !isAllowedBotSender(user, {
+              respondToBots: effectiveChannelConfig.respondToBots,
+              allowedBotIds: effectiveChannelConfig.allowedBotIds,
+            })
+          ) {
+            return;
+          }
+        } else if (user.bot) {
+          if (
+            !isAllowedBotSender(user, {
+              respondToBots: config.respondToBots,
+              allowedBotIds: config.allowedBotIds,
+            })
+          ) {
+            return;
+          }
+        }
 
         const inbound = {
           channel: CHANNEL_ID,

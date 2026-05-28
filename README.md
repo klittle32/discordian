@@ -57,21 +57,32 @@ letta channels pair \
 
 Discordian keeps the generic custom-channel registry open and applies Discord-aware policy inside the adapter. In `accounts.json`, leave top-level `dmPolicy` / `allowedUsers` open unless you deliberately want generic custom-channel filtering; use nested `config.dm_policy` and `config.allowed_users` for Discord DM authorization.
 
-Per-channel guild behavior is configured with `config.allowed_channels`. The preferred form separates **trigger** policy from **conversation** placement:
+Per-channel guild behavior is configured with `config.channels`. The preferred form separates **trigger** policy, **conversation** placement, and per-channel bot participation:
 
 ```json
-"allowed_channels": {
+"channels": {
   "DISCORD_CHANNEL_REQUIRES_MENTION_TOP_LEVEL": {
+    "comment": "Mention-triggered top-level channel example",
+    "channel_name": "#mentions-only",
+    "enabled": true,
     "trigger": "mention",
     "conversation": "channel"
   },
   "DISCORD_CHANNEL_AUTO_THREAD": {
+    "comment": "No-mention auto-thread channel example",
+    "channel_name": "#discordian-test",
+    "enabled": true,
     "trigger": "always",
     "conversation": "thread"
   },
-  "DISCORD_CHANNEL_MENTION_THREAD": {
-    "trigger": "mention",
-    "conversation": "thread"
+  "DISCORD_CHANNEL_NEEDLE_TRIAGE": {
+    "comment": "Needle integration channel; allows only the Needle bot",
+    "channel_name": "#needle-triage",
+    "enabled": true,
+    "trigger": "always",
+    "conversation": "thread",
+    "respond_to_bots": true,
+    "allowed_bot_ids": ["NEEDLE_BOT_USER_ID"]
   }
 }
 ```
@@ -87,7 +98,11 @@ Per-channel guild behavior is configured with `config.allowed_channels`. The pre
 - `channel` keeps the agent conversation in the top-level Discord channel.
 - `thread` creates or uses a Discord thread and routes replies there.
 
-Legacy config remains supported. Empty/missing `allowed_channels` is conservative: guild messages are allowed but top-level messages require a mention and stay in the channel. Legacy array entries and `"mention"` / `"mention-only"` remain mention-triggered, with placement derived from `auto_thread_on_mention`. Legacy `"open"` means no mention required in the top-level channel; use explicit `{ "trigger": "always", "conversation": "thread" }` for no-mention auto-threading.
+Account-level `respond_to_bots`, `allowed_bot_ids`, and `acknowledge_message_reaction` are defaults. A channel entry may override them. Discordian always ignores its own bot user, even if a channel allows bots.
+
+`comment` and `channel_name` are optional human-readable metadata fields for easier manual inspection of `accounts.json`. Discordian ignores them; the channel ID key remains authoritative.
+
+`allowed_channels` is deprecated and supported only as a legacy compatibility fallback for older `accounts.json` files. New configs should use `channels`. Empty/missing `channels` and `allowed_channels` is conservative: guild messages are allowed but top-level messages require a mention and stay in the channel. Legacy array entries and `"mention"` / `"mention-only"` remain mention-triggered, with placement derived from `auto_thread_on_mention`. Legacy `"open"` means no mention required in the top-level channel; use explicit `{ "trigger": "always", "conversation": "thread" }` under `channels` for no-mention auto-threading. If both `channels` and `allowed_channels` define the same channel, `channels` wins.
 
 For existing Discord threads under allowed parent channels, Discordian performs route repair: it creates or migrates the exact thread route needed by Letta's generic custom-channel registry before forwarding the inbound message. This keeps externally-created threads working without manual `routing.yaml` edits.
 

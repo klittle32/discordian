@@ -810,3 +810,57 @@ Current sender processing applies global `respondToBots` before guild channel po
      - reactions if possible.
 
 8. Commit after validation.
+
+### Per-channel config refactor smoke validation
+
+After implementing first-class `config.channels`, removing the duplicate live `allowed_channels` entry, deploying the current repo to `~/.letta/channels/discordian/`, reinstalling, and restarting a single listener, the following live tests passed:
+
+- `channels`-only config drove top-level no-tag auto-thread behavior with `allowed_channels: {}`.
+  - message/thread id: `1509547058036609174`
+- Existing-thread no-tag and tagged human messages routed through the existing thread without nested threads.
+  - no-tag message id: `1509547278921105620`
+  - tagged message id: `1509547452221489272`
+  - thread id: `1509547058036609174`
+- Old thread routing continued to work after the refactor and route-repair path.
+  - old thread id: `1509533185837629450`
+  - message id: `1509547680643154032`
+- Needle-created thread flow worked with per-channel bot override enabled on `#needle-jojo`.
+  - Needle sender id: `1509256975060304035`
+  - Needle message id: `1509554928530755746`
+  - thread/original message id: `1509554925955190864`
+  - parent channel id: `1509348071664779334`
+- `#needle-jojo` also handled a top-level human message with a JoJo mention directly, creating a JoJo thread while Needle skipped it.
+  - message/thread id: `1509555347319423016`
+- `#jojo-only-mention-required` accepted a top-level human message only when JoJo was mentioned, then created a thread.
+  - accepted message/thread id: `1509556178756309073`
+  - a separate no-mention top-level message in the same channel produced no Discordian delivery, confirming the negative path.
+- `#jojo-only-no-mention-or-thread` accepted top-level human messages without a mention and stayed in the channel rather than creating a thread.
+  - no-mention message id: `1509556671742087168`
+  - mention message id: `1509556922578370640`
+  - channel/chat id: `1509552736587350119`
+- Each validation used one listener process and produced one normal protocol delivery when a delivery was expected.
+- No lifecycle `Unknown Message` / reaction warnings appeared during these tests.
+
+Current validation state: ready to commit. Optional future hardening: restrict `#needle-jojo` `allowed_bot_ids` to Needle's bot user id instead of allowing any non-self bot, if that channel should become Needle-only rather than bot-friendly.
+
+### Roadmap: Discord reply-reference / grouped-message placement
+
+Future enhancement idea: add a placement style between current `conversation: "channel"` and `conversation: "thread"`.
+
+Options considered:
+
+- Keep `conversation: "channel"` and add a send-style flag such as `reply_to_message: true`, causing outbound replies to use Discord's message-reference UI while staying in the top-level channel.
+- Add a shorthand/alias such as `conversation: "reply"` for channel placement with Discord reply references.
+- Detect situations where multiple user messages arrive before the Letta agent responds and group them into a thread instead of replying to one specific source message.
+
+Open design questions:
+
+- If a single agent response corresponds to multiple inbound Discord messages, which message should the Discord reply reference?
+  - latest source message;
+  - first source message;
+  - no reference when ambiguous;
+  - split replies, if the runtime ever supports that cleanly.
+- Should grouped-message detection be a channel policy, a debounce policy, or a runtime-level behavior?
+- How would this interact with existing `conversation: "thread"` auto-threading and route repair?
+
+Decision for now: table this as a roadmap/future enhancement. Current refactor remains focused on first-class per-channel config, per-channel bot policy, and existing channel/thread placement behavior.

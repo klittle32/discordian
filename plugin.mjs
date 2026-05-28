@@ -37,8 +37,8 @@ function resolveGateChannelId(channelId, parentChannelId, isThread) {
 function isLegacyStringArray(allowedChannels) {
   return Array.isArray(allowedChannels);
 }
-function isChannelMap(allowedChannels) {
-  return !!allowedChannels && typeof allowedChannels === "object" && !Array.isArray(allowedChannels);
+function isChannelMap(value) {
+  return !!value && typeof value === "object" && !Array.isArray(value);
 }
 function defaultMentionConversation(autoThreadOnMention) {
   return autoThreadOnMention === false ? "channel" : "thread";
@@ -48,6 +48,12 @@ function isTrigger(value) {
 }
 function isConversation(value) {
   return value === "channel" || value === "thread";
+}
+function isBoolean(value) {
+  return typeof value === "boolean";
+}
+function normalizedStringList(value) {
+  return Array.isArray(value) ? value.filter((item) => typeof item === "string" && item.trim().length > 0) : [];
 }
 function normalizeStringPolicy(value, autoThreadOnMention) {
   switch (value) {
@@ -69,7 +75,7 @@ function normalizeStringPolicy(value, autoThreadOnMention) {
       return { allowed: false, trigger: "never", conversation: "channel" };
   }
 }
-function normalizeChannelPolicy(value, autoThreadOnMention) {
+function normalizeLegacyChannelPolicy(value, autoThreadOnMention) {
   if (typeof value === "string") {
     return normalizeStringPolicy(value, autoThreadOnMention);
   }
@@ -83,10 +89,9 @@ function normalizeChannelPolicy(value, autoThreadOnMention) {
   if (value === false || value == null) {
     return { allowed: false, trigger: "never", conversation: "channel" };
   }
-  if (typeof value === "object" && !Array.isArray(value)) {
-    const record = value;
-    const trigger = isTrigger(record.trigger) ? record.trigger : "mention";
-    const conversation = isConversation(record.conversation) ? record.conversation : defaultMentionConversation(autoThreadOnMention);
+  if (isChannelMap(value)) {
+    const trigger = isTrigger(value.trigger) ? value.trigger : "mention";
+    const conversation = isConversation(value.conversation) ? value.conversation : defaultMentionConversation(autoThreadOnMention);
     return {
       allowed: trigger !== "never",
       trigger,
@@ -95,21 +100,35 @@ function normalizeChannelPolicy(value, autoThreadOnMention) {
   }
   return { allowed: false, trigger: "never", conversation: "channel" };
 }
-function isDiscordGuildChannelAllowed(params) {
-  return resolveDiscordianChannelPolicy(params).allowed;
+function normalizeFirstClassChannelPolicy(value, autoThreadOnMention) {
+  if (!isChannelMap(value)) {
+    return normalizeLegacyChannelPolicy(value, autoThreadOnMention);
+  }
+  if (value.enabled === false) {
+    return { allowed: false, trigger: "never", conversation: "channel" };
+  }
+  const trigger = isTrigger(value.trigger) ? value.trigger : "mention";
+  const conversation = isConversation(value.conversation) ? value.conversation : defaultMentionConversation(autoThreadOnMention);
+  return {
+    allowed: trigger !== "never",
+    trigger,
+    conversation
+  };
 }
-function resolveDiscordianChannelPolicy(params) {
-  const {
-    channelId,
-    parentChannelId,
-    isThread,
-    allowedChannels,
-    autoThreadOnMention
-  } = params;
+function resolveChannelEntry(channels, gateChannelId) {
+  if (!isChannelMap(channels))
+    return;
+  if (gateChannelId in channels)
+    return channels[gateChannelId];
+  if ("*" in channels)
+    return channels["*"];
+  return;
+}
+function resolveLegacyPolicy(options) {
+  const { gateChannelId, allowedChannels, autoThreadOnMention } = options;
   if (!allowedChannels) {
     return { allowed: true, trigger: "mention", conversation: "channel" };
   }
-  const gateChannelId = resolveGateChannelId(channelId, parentChannelId, isThread);
   if (isLegacyStringArray(allowedChannels)) {
     if (allowedChannels.length === 0) {
       return { allowed: true, trigger: "mention", conversation: "channel" };
@@ -129,14 +148,41 @@ function resolveDiscordianChannelPolicy(params) {
       return { allowed: true, trigger: "mention", conversation: "channel" };
     }
     if (gateChannelId in allowedChannels) {
-      return normalizeChannelPolicy(allowedChannels[gateChannelId], autoThreadOnMention);
+      return normalizeLegacyChannelPolicy(allowedChannels[gateChannelId], autoThreadOnMention);
     }
     if ("*" in allowedChannels) {
-      return normalizeChannelPolicy(allowedChannels["*"], autoThreadOnMention);
+      return normalizeLegacyChannelPolicy(allowedChannels["*"], autoThreadOnMention);
     }
     return { allowed: false, trigger: "never", conversation: "channel" };
   }
   return { allowed: true, trigger: "mention", conversation: "channel" };
+}
+function resolveDiscordianEffectiveChannelConfig(params) {
+  const {
+    channelId,
+    parentChannelId,
+    isThread,
+    channels,
+    allowedChannels,
+    autoThreadOnMention,
+    respondToBots,
+    allowedBotIds,
+    acknowledgeMessageReaction
+  } = params;
+  const gateChannelId = resolveGateChannelId(channelId, parentChannelId, isThread);
+  const channelEntry = resolveChannelEntry(channels, gateChannelId);
+  const policy = channelEntry !== undefined ? normalizeFirstClassChannelPolicy(channelEntry, autoThreadOnMention) : resolveLegacyPolicy({
+    gateChannelId,
+    allowedChannels,
+    autoThreadOnMention
+  });
+  const channelRecord = isChannelMap(channelEntry) ? channelEntry : undefined;
+  return {
+    ...policy,
+    respondToBots: isBoolean(channelRecord?.respond_to_bots) ? channelRecord.respond_to_bots : respondToBots === true,
+    allowedBotIds: Array.isArray(channelRecord?.allowed_bot_ids) ? normalizedStringList(channelRecord.allowed_bot_ids) : normalizedStringList(allowedBotIds),
+    acknowledgeMessageReaction: isBoolean(channelRecord?.acknowledge_message_reaction) ? channelRecord.acknowledge_message_reaction : acknowledgeMessageReaction === true
+  };
 }
 
 // error-reply.ts
@@ -487,27 +533,34 @@ function createDiscordAdapter(config) {
     seenIngressMessageKeys.set(key, now + INGRESS_DEDUPE_TTL_MS);
     return false;
   }
-  function normalizedStringList(value) {
+  function normalizedStringList2(value) {
     return Array.isArray(value) ? value.filter((item) => typeof item === "string" && item.trim().length > 0) : [];
   }
-  function shouldProcessDiscordSender(user, chatType) {
-    if (!user.id)
+  function isSelfDiscordUser(user) {
+    return !user.id || user.id === botUserId;
+  }
+  function isAllowedBotSender(user, options) {
+    if (!user.bot)
+      return true;
+    if (options.respondToBots !== true)
       return false;
-    if (user.id === botUserId)
+    const allowedBotIds = normalizedStringList2(options.allowedBotIds);
+    if (allowedBotIds.length === 0)
+      return true;
+    return allowedBotIds.includes(user.id);
+  }
+  function shouldProcessDiscordDmSender(user) {
+    if (isSelfDiscordUser(user))
       return false;
     if (user.bot) {
-      if (config.respondToBots !== true)
-        return false;
-      const allowedBotIds = normalizedStringList(config.allowedBotIds);
-      if (allowedBotIds.length === 0)
-        return true;
-      return allowedBotIds.includes(user.id);
+      return isAllowedBotSender(user, {
+        respondToBots: config.respondToBots,
+        allowedBotIds: config.allowedBotIds
+      });
     }
-    if (chatType === "direct") {
-      const discordianDmPolicy = config.discordianDmPolicy ?? config.dmPolicy;
-      if (discordianDmPolicy === "allowlist") {
-        return normalizedStringList(config.discordianAllowedUsers).includes(user.id);
-      }
+    const discordianDmPolicy = config.discordianDmPolicy ?? config.dmPolicy;
+    if (discordianDmPolicy === "allowlist") {
+      return normalizedStringList2(config.discordianAllowedUsers).includes(user.id);
     }
     return true;
   }
@@ -836,15 +889,15 @@ function createDiscordAdapter(config) {
         if (!userId)
           return;
         const chatType = resolveDiscordChatType(message.guildId);
-        if (!shouldProcessDiscordSender(message.author, chatType)) {
-          if (chatType === "direct" && !message.author.bot) {
-            await adapter.sendDirectReply(message.channelId, "You are not on the allowed users list for this Discordian bot.");
-          }
-          return;
-        }
         const isThread = isThreadMessage(message);
         const wasMentioned = chatType === "channel" && hasBotMention(message);
         if (chatType === "direct") {
+          if (!shouldProcessDiscordDmSender(message.author)) {
+            if (!message.author.bot) {
+              await adapter.sendDirectReply(message.channelId, "You are not on the allowed users list for this Discordian bot.");
+            }
+            return;
+          }
           if (markIngressMessageSeen(message.id))
             return;
           const attachments2 = await collectAttachments(message.attachments, message.channelId);
@@ -874,15 +927,27 @@ function createDiscordAdapter(config) {
           return;
         }
         const parentChannelId = message.channel.parentId ?? null;
-        const channelPolicy = resolveDiscordianChannelPolicy({
+        const channelPolicy = resolveDiscordianEffectiveChannelConfig({
           channelId: message.channelId,
           parentChannelId,
           isThread,
+          channels: config.channels,
           allowedChannels: config.allowedChannels,
-          autoThreadOnMention: config.autoThreadOnMention
+          autoThreadOnMention: config.autoThreadOnMention,
+          respondToBots: config.respondToBots,
+          allowedBotIds: config.allowedBotIds,
+          acknowledgeMessageReaction: config.acknowledgeMessageReaction
         });
         if (!channelPolicy.allowed)
           return;
+        if (isSelfDiscordUser(message.author))
+          return;
+        if (message.author.bot && !isAllowedBotSender(message.author, {
+          respondToBots: channelPolicy.respondToBots,
+          allowedBotIds: channelPolicy.allowedBotIds
+        })) {
+          return;
+        }
         const shouldTrigger = isThread || channelPolicy.trigger === "always" || channelPolicy.trigger === "mention" && wasMentioned;
         if (!shouldTrigger)
           return;
@@ -936,8 +1001,7 @@ function createDiscordAdapter(config) {
       const handleReactionEvent = async (reaction, user, action) => {
         if (!adapter.onMessage)
           return;
-        const reactionChatType = resolveDiscordChatType(reaction.message.guildId);
-        if (!shouldProcessDiscordSender(user, reactionChatType))
+        if (isSelfDiscordUser(user))
           return;
         try {
           if (reaction.partial)
@@ -958,13 +1022,35 @@ function createDiscordAdapter(config) {
         const isThread = msg.channel && "isThread" in msg.channel && typeof msg.channel.isThread === "function" && msg.channel.isThread();
         if (chatType === "channel" && !isThread)
           return;
-        if (chatType === "channel" && isThread && !isDiscordGuildChannelAllowed({
-          channelId,
-          parentChannelId: msg.channel.parentId ?? null,
-          isThread: true,
-          allowedChannels: config.allowedChannels
-        }))
-          return;
+        let effectiveChannelConfig;
+        if (chatType === "channel" && isThread) {
+          effectiveChannelConfig = resolveDiscordianEffectiveChannelConfig({
+            channelId,
+            parentChannelId: msg.channel.parentId ?? null,
+            isThread: true,
+            channels: config.channels,
+            allowedChannels: config.allowedChannels,
+            autoThreadOnMention: config.autoThreadOnMention,
+            respondToBots: config.respondToBots,
+            allowedBotIds: config.allowedBotIds,
+            acknowledgeMessageReaction: config.acknowledgeMessageReaction
+          });
+          if (!effectiveChannelConfig.allowed)
+            return;
+          if (user.bot && !isAllowedBotSender(user, {
+            respondToBots: effectiveChannelConfig.respondToBots,
+            allowedBotIds: effectiveChannelConfig.allowedBotIds
+          })) {
+            return;
+          }
+        } else if (user.bot) {
+          if (!isAllowedBotSender(user, {
+            respondToBots: config.respondToBots,
+            allowedBotIds: config.allowedBotIds
+          })) {
+            return;
+          }
+        }
         const inbound = {
           channel: CHANNEL_ID,
           accountId: config.accountId,
@@ -1265,6 +1351,7 @@ function normalizeAccount(account) {
     discordianAllowedUsers,
     dmPolicy: "open",
     allowedUsers: [],
+    channels: readConfig(account, "channels", readConfig(account, "channels", undefined)),
     allowedChannels: readConfig(account, "allowedChannels", readConfig(account, "allowed_channels", undefined)),
     autoThreadOnMention: readConfig(account, "autoThreadOnMention", readConfig(account, "auto_thread_on_mention", true)),
     threadPolicyByChannel: readConfig(account, "threadPolicyByChannel", readConfig(account, "thread_policy_by_channel", undefined)),

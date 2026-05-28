@@ -46,6 +46,11 @@ function normalizeAccount(account) {
     // check does not incorrectly reject guild/thread messages.
     dmPolicy: "open",
     allowedUsers: [],
+    channels: readConfig(
+      account,
+      "channels",
+      readConfig(account, "channels", undefined),
+    ),
     allowedChannels: readConfig(
       account,
       "allowedChannels",
