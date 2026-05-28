@@ -933,3 +933,50 @@ Implementation steps:
 4. Remove obsolete compatibility wrappers/helpers if no code uses them.
 5. Remove legacy/deprecated config references from README, example config, and implementation notes; keep old history in `docs/PLAN.md` only as historical context.
 6. Rebuild `plugin.mjs`, run syntax/diff checks, redeploy, and re-run the three-channel smoke matrix.
+
+### Next roadmap item: per-thread Letta conversation isolation
+
+This is the next significant roadmap item after the first-class channel config cleanup. It is a delicate routing/context feature and should be investigated and implemented separately from the channel-policy refactors.
+
+Live testing confirmed that manually-created Discord threads under a `conversation: "channel"` parent are routed and repaired correctly, but they currently reuse the configured/default Letta conversation rather than allocating a fresh context window per Discord thread.
+
+Observed example:
+
+- parent channel id: `1509552736587350119`
+- manual thread/chat id: `1509569713477255278`
+- route used existing Letta conversation: `conv-6446c2cb-e883-4502-ad55-423b88f1c9e0`
+
+Current behavior:
+
+- `conversation: "channel"` prevents automatic thread creation for top-level messages.
+- Existing/manual Discord threads are still accepted via route repair.
+- Route repair creates a separate Discordian chat surface for the thread, but binds it to the same configured/default Letta conversation.
+
+Target behavior to investigate:
+
+- Each Discord thread should get exactly one Letta conversation/context window.
+- Existing thread routes should be reused.
+- Missing thread routes should create a fresh Letta conversation bound to the configured agent, then bind the Discord thread route to that conversation.
+- Top-level channel routes may remain shared channel-level conversations.
+- Thread route creation/repair should avoid silently reusing the account/default conversation unless an explicit compatibility policy is introduced.
+
+Open questions:
+
+- Which runtime/API path should create a Letta conversation from inside a custom-channel adapter?
+- Should this apply to all Discord threads, only auto-created threads, only manual/external threads, or be configurable?
+- Should `conversation: "thread"` always imply new Letta conversation per Discord thread?
+- How should existing routes be migrated if this changes?
+- How should thread history seeding interact with a fresh Letta conversation?
+- What starter context should be injected for auto-created, manual, and Needle-created threads?
+- How should failures be surfaced if thread route creation succeeds but conversation creation fails?
+
+Initial implementation sketch:
+
+1. Locate the Letta Code custom-channel route creation/repair path and determine whether it can create conversations directly.
+2. If needed, add or call a runtime/API helper that creates a conversation for the configured agent.
+3. On missing Discord thread route, create a new Letta conversation, then persist the thread route with that conversation id.
+4. Reuse existing thread routes unchanged.
+5. Seed new thread conversations with the thread starter/recent history where practical.
+6. Test auto-created threads, manual threads, Needle-created threads, repeated messages in the same thread, and top-level channel routes.
+
+Decision for now: treat this as the next major roadmap item, not part of the current channel-config cleanup.
