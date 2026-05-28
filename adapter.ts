@@ -1,7 +1,8 @@
-import { basename } from "node:path";
+import { promises as fs } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import {
   isDiscordGuildChannelAllowed,
-  resolveDiscordChannelMode,
+  resolveDiscordianChannelPolicy,
 } from "./channel-gating";
 import { formatDiscordDeliveryError } from "./error-reply";
 import {
@@ -133,6 +134,22 @@ interface DiscordClient {
   destroy: () => void;
 }
 
+interface DiscordianRoute {
+  accountId?: string;
+  chatId?: string;
+  chatType?: string;
+  threadId?: string | null;
+  agentId?: string | null;
+  conversationId?: string | null;
+  enabled?: boolean;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+interface DiscordianRoutesFile {
+  routes?: DiscordianRoute[];
+}
+
 type DiscordMessage = DiscordMessageLike;
 
 const DISCORD_SPLIT_THRESHOLD = 1900;
@@ -248,15 +265,6 @@ function resolveDiscordReactionEmoji(value: string): string {
     x: "❌",
   };
   return nameMap[normalized] ?? normalized;
-}
-
-export function shouldAutoThreadOnDiscordMention(
-  account,
-  channelId,
-) {
-  const override = account.threadPolicyByChannel?.[channelId];
-  if (typeof override === "boolean") return override;
-  return account.autoThreadOnMention ?? false;
 }
 
 export function buildDiscordIngressMessageKey(
@@ -478,14 +486,31 @@ export function createDiscordAdapter(
     return true;
   }
 
+  function shouldSkipLifecycleReaction(source): boolean {
+    // Adapter-private fields are not guaranteed to survive the generic
+    // lifecycle path. Auto-threaded top-level guild messages can be recognized
+    // after normalization because their starter message id is also the thread
+    // id/chat id; reacting to that message from inside the thread yields
+    // Discord's "Unknown Message". Thread replies still have distinct message
+    // ids and continue to get lifecycle reactions.
+    return (
+      source.skipLifecycleReactions === true ||
+      (isNonEmptyString(source.messageId) &&
+        (source.threadId === source.messageId || source.chatId === source.messageId))
+    );
+  }
+
   async function sendLifecycleReaction(
     source,
     emoji: string,
     remove = false,
   ): Promise<void> {
+    if (shouldSkipLifecycleReaction(source)) return;
     if (!client || !isNonEmptyString(source.messageId)) return;
     try {
-      const channel = await client.channels.fetch(source.chatId);
+      const reactionChannelId =
+        source.lifecycleReactionChatId ?? source.chatId;
+      const channel = await client.channels.fetch(reactionChannelId);
       if (!hasDiscordMessageFetcher(channel)) return;
       const message = await channel.messages.fetch(source.messageId);
       const resolvedEmoji = resolveDiscordReactionEmoji(emoji);
@@ -610,7 +635,12 @@ export function createDiscordAdapter(
     return typeof ch.isThread === "function" && ch.isThread();
   }
 
-  async function createThreadForMention(
+  function isDiscordThreadAlreadyExistsError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    return message.toLowerCase().includes("thread has already been created");
+  }
+
+  async function createThreadForMessage(
     message: DiscordMessage,
     seedText: string,
   ): Promise<{ id: string; name?: string } | null> {
@@ -622,16 +652,104 @@ export function createDiscordAdapter(
     try {
       const thread = await message.startThread({
         name: threadName,
-        reason: "letta-code discord mention trigger",
+        reason: "letta-code discordian auto-thread",
       });
       return { id: thread.id, name: thread.name ?? undefined };
     } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      if (isDiscordThreadAlreadyExistsError(error)) {
+        const existingThread = await client?.channels
+          .fetch(message.id)
+          .catch(() => null);
+        if (existingThread && "id" in existingThread) {
+          return {
+            id: existingThread.id,
+            name:
+              "name" in existingThread && typeof existingThread.name === "string"
+                ? existingThread.name
+                : undefined,
+          };
+        }
+        return { id: message.id };
+      }
       console.warn(
-        "[Discord] Failed to create thread for mention:",
-        error instanceof Error ? error.message : error,
+        "[Discord] Failed to create thread for message:",
+        errorMessage,
       );
       return null;
     }
+  }
+
+  async function getDiscordianRoutes(): Promise<{
+    routingPath: string;
+    routes: DiscordianRoute[];
+  }> {
+    // Letta custom-channel routing files use JSON content in routing.yaml.
+    const routingPath = join(
+      process.env.HOME || ".",
+      ".letta",
+      "channels",
+      CHANNEL_ID,
+      "routing.yaml",
+    );
+    let routes: DiscordianRoute[] = [];
+    try {
+      const parsed = JSON.parse(
+        await fs.readFile(routingPath, "utf8"),
+      ) as DiscordianRoutesFile;
+      routes = Array.isArray(parsed.routes) ? parsed.routes : [];
+    } catch {}
+    return { routingPath, routes };
+  }
+
+  async function saveDiscordianRoutes(
+    routingPath: string,
+    routes: DiscordianRoute[],
+  ): Promise<void> {
+    await fs.mkdir(dirname(routingPath), { recursive: true });
+    await fs.writeFile(
+      routingPath,
+      JSON.stringify({ routes }, null, 2) + "\n",
+      "utf8",
+    );
+  }
+
+  async function ensureDiscordianChannelRoute(channelId: string): Promise<void> {
+    if (!config.agentId) return;
+    const { routingPath, routes } = await getDiscordianRoutes();
+    const existingRoute = routes.find(
+      (route) =>
+        route.accountId === config.accountId &&
+        route.chatId === channelId &&
+        (route.threadId ?? null) === null &&
+        route.enabled !== false,
+    );
+    if (existingRoute) return;
+
+    const now = new Date().toISOString();
+    const route = {
+      accountId: config.accountId,
+      chatId: channelId,
+      chatType: "channel",
+      threadId: null,
+      agentId: config.agentId,
+      conversationId:
+        config.conversationId ?? process.env.LETTA_CONVERSATION_ID ?? "default",
+      enabled: true,
+      createdAt: now,
+      updatedAt: now,
+    };
+    routes.push(route);
+    await saveDiscordianRoutes(routingPath, routes);
+    console.log(
+      "[Discordian] Created channel route",
+      JSON.stringify({
+        accountId: config.accountId,
+        channelId,
+        agentId: route.agentId,
+        conversationId: route.conversationId,
+      }),
+    );
   }
 
   async function ensureDiscordianThreadRoute(
@@ -639,20 +757,7 @@ export function createDiscordAdapter(
     threadId: string,
   ): Promise<void> {
     if (!config.agentId) return;
-    const fs = await import("node:fs/promises");
-    const path = await import("node:path");
-    const routingPath = path.join(
-      process.env.HOME || ".",
-      ".letta",
-      "channels",
-      CHANNEL_ID,
-      "routing.yaml",
-    );
-    let routes: any[] = [];
-    try {
-      const parsed = JSON.parse(await fs.readFile(routingPath, "utf8"));
-      routes = Array.isArray(parsed.routes) ? parsed.routes : [];
-    } catch {}
+    const { routingPath, routes } = await getDiscordianRoutes();
     const existingExactRoute = routes.find(
       (route) =>
         route.accountId === config.accountId &&
@@ -673,12 +778,7 @@ export function createDiscordAdapter(
       incompleteThreadRoute.threadId = threadId;
       incompleteThreadRoute.chatType = incompleteThreadRoute.chatType ?? "channel";
       incompleteThreadRoute.updatedAt = new Date().toISOString();
-      await fs.mkdir(path.dirname(routingPath), { recursive: true });
-      await fs.writeFile(
-        routingPath,
-        JSON.stringify({ routes }, null, 2) + "\n",
-        "utf8",
-      );
+      await saveDiscordianRoutes(routingPath, routes);
       console.log(
         "[Discordian] Migrated thread route",
         JSON.stringify({ accountId: config.accountId, parentChannelId, threadId }),
@@ -709,12 +809,7 @@ export function createDiscordAdapter(
       updatedAt: now,
     };
     routes.push(route);
-    await fs.mkdir(path.dirname(routingPath), { recursive: true });
-    await fs.writeFile(
-      routingPath,
-      JSON.stringify({ routes }, null, 2) + "\n",
-      "utf8",
-    );
+    await saveDiscordianRoutes(routingPath, routes);
     console.log(
       "[Discordian] Created thread route",
       JSON.stringify({
@@ -841,33 +936,26 @@ export function createDiscordAdapter(
         }
 
         // ── Guild handling ────────────────────────────────────────
-        // Outside a thread:
-        //   - "open" channels process every non-bot message
-        //   - "mention-only" channels process @mentions only
-        // Inside a thread: surface messages and let the registry decide whether
-        // the thread is already routed, or whether a new mention is required.
+        // Per-channel policy separates trigger behavior from conversation
+        // placement. Top-level messages must satisfy the trigger policy; thread
+        // messages are surfaced when their parent channel is allowed and the
+        // exact thread route exists or can be created.
         const parentChannelId =
           (message.channel as { parentId?: string | null }).parentId ?? null;
-        const channelMode = resolveDiscordChannelMode(
-          message.channelId,
+        const channelPolicy = resolveDiscordianChannelPolicy({
+          channelId: message.channelId,
           parentChannelId,
           isThread,
-          config.allowedChannels,
-        );
-        const isOpenChannel = channelMode === "open";
-        if (!isThread && !wasMentioned && !isOpenChannel) return;
+          allowedChannels: config.allowedChannels,
+          autoThreadOnMention: config.autoThreadOnMention,
+        });
+        if (!channelPolicy.allowed) return;
 
-        // Channel allowlist: when configured, only process guild messages whose
-        // channel ID (or parent channel ID for thread messages) is allowed.
-        if (
-          !isDiscordGuildChannelAllowed({
-            channelId: message.channelId,
-            parentChannelId,
-            isThread,
-            allowedChannels: config.allowedChannels,
-          })
-        )
-          return;
+        const shouldTrigger =
+          isThread ||
+          channelPolicy.trigger === "always" ||
+          (channelPolicy.trigger === "mention" && wasMentioned);
+        if (!shouldTrigger) return;
 
         if (markIngressMessageSeen(message.id)) return;
 
@@ -876,17 +964,21 @@ export function createDiscordAdapter(
           ? message.channelId
           : null;
 
-        // If mentioned outside a thread, create one. For custom-channel parity,
-        // persist a thread-specific route before emitting inbound so the generic
-        // registry can find the newly-created thread immediately. Native Discord
-        // gets this from first-party ensureDiscordRoute; custom `discordian`
-        // would otherwise fall through to the generic "no route" reply.
-        if (!isThread && wasMentioned) {
-          const createdThread = await createThreadForMention(message, content);
+        // Place the conversation according to the per-channel policy. For
+        // thread placement, persist a thread-specific route before emitting
+        // inbound so the generic registry can find the newly-created thread
+        // immediately. For channel placement, ensure a top-level channel route
+        // exists when an agent_id is configured.
+        const movedTopLevelMessageToThread =
+          !isThread && channelPolicy.conversation === "thread";
+        if (movedTopLevelMessageToThread) {
+          const createdThread = await createThreadForMessage(message, content);
           if (!createdThread) return;
           effectiveChatId = createdThread.id;
           effectiveThreadId = createdThread.id;
           await ensureDiscordianThreadRoute(message.channelId, createdThread.id);
+        } else if (!isThread && channelPolicy.conversation === "channel") {
+          await ensureDiscordianChannelRoute(message.channelId);
         } else if (isThread && effectiveThreadId) {
           await ensureDiscordianThreadRoute(
             parentChannelId ?? message.channelId,
@@ -923,7 +1015,8 @@ export function createDiscordAdapter(
             : message.channelId,
           chatType: "channel",
           isMention: wasMentioned,
-          isOpenChannel,
+          isOpenChannel: channelPolicy.trigger === "always",
+          skipLifecycleReactions: movedTopLevelMessageToThread,
           attachments,
           raw: message,
         };

@@ -53,11 +53,56 @@ letta channels pair \
   --conversation <conversation-id>
 ```
 
+## Discordian account policy
+
+Discordian keeps the generic custom-channel registry open and applies Discord-aware policy inside the adapter. In `accounts.json`, leave top-level `dmPolicy` / `allowedUsers` open unless you deliberately want generic custom-channel filtering; use nested `config.dm_policy` and `config.allowed_users` for Discord DM authorization.
+
+Per-channel guild behavior is configured with `config.allowed_channels`. The preferred form separates **trigger** policy from **conversation** placement:
+
+```json
+"allowed_channels": {
+  "DISCORD_CHANNEL_REQUIRES_MENTION_TOP_LEVEL": {
+    "trigger": "mention",
+    "conversation": "channel"
+  },
+  "DISCORD_CHANNEL_AUTO_THREAD": {
+    "trigger": "always",
+    "conversation": "thread"
+  },
+  "DISCORD_CHANNEL_MENTION_THREAD": {
+    "trigger": "mention",
+    "conversation": "thread"
+  }
+}
+```
+
+`trigger` controls top-level Discord channel messages:
+
+- `mention` requires a mention of the Discordian bot.
+- `always` accepts authorized messages without a mention.
+- `never` disables that channel.
+
+`conversation` controls where replies go after a message triggers:
+
+- `channel` keeps the agent conversation in the top-level Discord channel.
+- `thread` creates or uses a Discord thread and routes replies there.
+
+Legacy config remains supported. Empty/missing `allowed_channels` is conservative: guild messages are allowed but top-level messages require a mention and stay in the channel. Legacy array entries and `"mention"` / `"mention-only"` remain mention-triggered, with placement derived from `auto_thread_on_mention`. Legacy `"open"` means no mention required in the top-level channel; use explicit `{ "trigger": "always", "conversation": "thread" }` for no-mention auto-threading.
+
+For existing Discord threads under allowed parent channels, Discordian performs route repair: it creates or migrates the exact thread route needed by Letta's generic custom-channel registry before forwarding the inbound message. This keeps externally-created threads working without manual `routing.yaml` edits.
+
 ## Development notes
 
-The adapter currently contains TODOs for the real transport layer:
+Build the bundled plugin after source changes:
 
-1. Connect to the target platform in `start()`.
-2. Call `this.onMessage(...)` for inbound messages.
-3. Implement `sendMessage(...)` so agent replies reach the source chat.
-4. Clean up network resources in `stop()`.
+```bash
+bun build plugin.ts \
+  --target=node \
+  --format=esm \
+  --outfile=plugin.mjs \
+  --external:discord.js \
+  --external:./runtime.mjs \
+  --external:./transcription-stub.mjs
+```
+
+During live testing, make sure only one listener process is running for a Discord bot/account. Multiple `letta server --channels discordian` processes will each receive the same Discord event and cause duplicate deliveries.

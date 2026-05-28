@@ -1,4 +1,3 @@
-import { createRequire } from "node:module";
 var __defProp = Object.defineProperty;
 var __returnValue = (v) => v;
 function __exportSetter(name, newValue) {
@@ -13,7 +12,6 @@ var __export = (target, all) => {
       set: __exportSetter.bind(all, name)
     });
 };
-var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // transcription-stub.mjs
 var exports_transcription_stub = {};
@@ -29,7 +27,8 @@ async function transcribeAudioFile() {
 }
 
 // adapter.ts
-import { basename } from "node:path";
+import { promises as fs } from "node:fs";
+import { basename, dirname as dirname2, join as join3 } from "node:path";
 
 // channel-gating.ts
 function resolveGateChannelId(channelId, parentChannelId, isThread) {
@@ -38,48 +37,106 @@ function resolveGateChannelId(channelId, parentChannelId, isThread) {
 function isLegacyStringArray(allowedChannels) {
   return Array.isArray(allowedChannels);
 }
-function isModeMap(allowedChannels) {
+function isChannelMap(allowedChannels) {
   return !!allowedChannels && typeof allowedChannels === "object" && !Array.isArray(allowedChannels);
 }
-function isDiscordGuildChannelAllowed(params) {
-  const { channelId, parentChannelId, isThread, allowedChannels } = params;
-  if (!allowedChannels) {
-    return true;
-  }
-  if (isLegacyStringArray(allowedChannels)) {
-    if (allowedChannels.length === 0) {
-      return true;
-    }
-    const gateChannelId = resolveGateChannelId(channelId, parentChannelId, isThread);
-    return allowedChannels.includes(gateChannelId);
-  }
-  if (isModeMap(allowedChannels)) {
-    if (Object.keys(allowedChannels).length === 0) {
-      return true;
-    }
-    const gateChannelId = resolveGateChannelId(channelId, parentChannelId, isThread);
-    return gateChannelId in allowedChannels || "*" in allowedChannels;
-  }
-  return true;
+function defaultMentionConversation(autoThreadOnMention) {
+  return autoThreadOnMention === false ? "channel" : "thread";
 }
-function resolveDiscordChannelMode(channelId, parentChannelId, isThread, allowedChannels) {
+function isTrigger(value) {
+  return value === "mention" || value === "always" || value === "never";
+}
+function isConversation(value) {
+  return value === "channel" || value === "thread";
+}
+function normalizeStringPolicy(value, autoThreadOnMention) {
+  switch (value) {
+    case "open":
+    case "always":
+      return { allowed: true, trigger: "always", conversation: "channel" };
+    case "mention":
+    case "mention-only":
+      return {
+        allowed: true,
+        trigger: "mention",
+        conversation: defaultMentionConversation(autoThreadOnMention)
+      };
+    case "off":
+    case "never":
+    case "disabled":
+      return { allowed: false, trigger: "never", conversation: "channel" };
+    default:
+      return { allowed: false, trigger: "never", conversation: "channel" };
+  }
+}
+function normalizeChannelPolicy(value, autoThreadOnMention) {
+  if (typeof value === "string") {
+    return normalizeStringPolicy(value, autoThreadOnMention);
+  }
+  if (value === true) {
+    return {
+      allowed: true,
+      trigger: "mention",
+      conversation: defaultMentionConversation(autoThreadOnMention)
+    };
+  }
+  if (value === false || value == null) {
+    return { allowed: false, trigger: "never", conversation: "channel" };
+  }
+  if (typeof value === "object" && !Array.isArray(value)) {
+    const record = value;
+    const trigger = isTrigger(record.trigger) ? record.trigger : "mention";
+    const conversation = isConversation(record.conversation) ? record.conversation : defaultMentionConversation(autoThreadOnMention);
+    return {
+      allowed: trigger !== "never",
+      trigger,
+      conversation
+    };
+  }
+  return { allowed: false, trigger: "never", conversation: "channel" };
+}
+function isDiscordGuildChannelAllowed(params) {
+  return resolveDiscordianChannelPolicy(params).allowed;
+}
+function resolveDiscordianChannelPolicy(params) {
+  const {
+    channelId,
+    parentChannelId,
+    isThread,
+    allowedChannels,
+    autoThreadOnMention
+  } = params;
   if (!allowedChannels) {
-    return null;
+    return { allowed: true, trigger: "mention", conversation: "channel" };
   }
   const gateChannelId = resolveGateChannelId(channelId, parentChannelId, isThread);
   if (isLegacyStringArray(allowedChannels)) {
     if (allowedChannels.length === 0) {
-      return null;
+      return { allowed: true, trigger: "mention", conversation: "channel" };
     }
-    return allowedChannels.includes(gateChannelId) ? "mention-only" : null;
-  }
-  if (isModeMap(allowedChannels)) {
-    if (Object.keys(allowedChannels).length === 0) {
-      return null;
+    if (!allowedChannels.includes(gateChannelId)) {
+      return { allowed: false, trigger: "never", conversation: "channel" };
     }
-    return allowedChannels[gateChannelId] ?? allowedChannels["*"] ?? null;
+    return {
+      allowed: true,
+      trigger: "mention",
+      conversation: defaultMentionConversation(autoThreadOnMention)
+    };
   }
-  return null;
+  if (isChannelMap(allowedChannels)) {
+    const keys = Object.keys(allowedChannels);
+    if (keys.length === 0) {
+      return { allowed: true, trigger: "mention", conversation: "channel" };
+    }
+    if (gateChannelId in allowedChannels) {
+      return normalizeChannelPolicy(allowedChannels[gateChannelId], autoThreadOnMention);
+    }
+    if ("*" in allowedChannels) {
+      return normalizeChannelPolicy(allowedChannels["*"], autoThreadOnMention);
+    }
+    return { allowed: false, trigger: "never", conversation: "channel" };
+  }
+  return { allowed: true, trigger: "mention", conversation: "channel" };
 }
 
 // error-reply.ts
@@ -253,21 +310,21 @@ async function resolveDiscordThreadHistory(params) {
 }
 
 // runtime.mjs
-import { createRequire as createRequire2 } from "node:module";
+import { createRequire } from "node:module";
 import { dirname, join as join2 } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 var CHANNEL_ID = "discordian";
 var DISPLAY_NAME = "Discordian";
 var __dirname2 = dirname(fileURLToPath(import.meta.url));
 async function loadDiscordModule() {
-  const require2 = createRequire2(import.meta.url);
+  const require2 = createRequire(import.meta.url);
   const candidates = [
     join2(__dirname2, "runtime", "package.json"),
     join2(__dirname2, "package.json")
   ];
   for (const candidate of candidates) {
     try {
-      const resolved = createRequire2(candidate).resolve("discord.js");
+      const resolved = createRequire(candidate).resolve("discord.js");
       return import(pathToFileURL(resolved).href);
     } catch {}
   }
@@ -507,11 +564,17 @@ function createDiscordAdapter(config) {
     lifecycleErrorReplyKeys.set(key, Date.now());
     return true;
   }
+  function shouldSkipLifecycleReaction(source) {
+    return source.skipLifecycleReactions === true || isNonEmptyString(source.messageId) && (source.threadId === source.messageId || source.chatId === source.messageId);
+  }
   async function sendLifecycleReaction(source, emoji, remove = false) {
+    if (shouldSkipLifecycleReaction(source))
+      return;
     if (!client || !isNonEmptyString(source.messageId))
       return;
     try {
-      const channel = await client.channels.fetch(source.chatId);
+      const reactionChannelId = source.lifecycleReactionChatId ?? source.chatId;
+      const channel = await client.channels.fetch(reactionChannelId);
       if (!hasDiscordMessageFetcher(channel))
         return;
       const message = await channel.messages.fetch(source.messageId);
@@ -604,7 +667,11 @@ function createDiscordAdapter(config) {
     const ch = message.channel;
     return typeof ch.isThread === "function" && ch.isThread();
   }
-  async function createThreadForMention(message, seedText) {
+  function isDiscordThreadAlreadyExistsError(error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return message.toLowerCase().includes("thread has already been created");
+  }
+  async function createThreadForMessage(message, seedText) {
     const normalized = seedText.replace(/<@!?\d+>/g, "").trim();
     const firstLine = normalized.split(`
 `)[0]?.trim();
@@ -612,25 +679,71 @@ function createDiscordAdapter(config) {
     try {
       const thread = await message.startThread({
         name: threadName,
-        reason: "letta-code discord mention trigger"
+        reason: "letta-code discordian auto-thread"
       });
       return { id: thread.id, name: thread.name ?? undefined };
     } catch (error) {
-      console.warn("[Discord] Failed to create thread for mention:", error instanceof Error ? error.message : error);
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      if (isDiscordThreadAlreadyExistsError(error)) {
+        const existingThread = await client?.channels.fetch(message.id).catch(() => null);
+        if (existingThread && "id" in existingThread) {
+          return {
+            id: existingThread.id,
+            name: "name" in existingThread && typeof existingThread.name === "string" ? existingThread.name : undefined
+          };
+        }
+        return { id: message.id };
+      }
+      console.warn("[Discord] Failed to create thread for message:", errorMessage);
       return null;
     }
   }
-  async function ensureDiscordianThreadRoute(parentChannelId, threadId) {
-    if (!config.agentId)
-      return;
-    const fs = await import("node:fs/promises");
-    const path = await import("node:path");
-    const routingPath = path.join(process.env.HOME || ".", ".letta", "channels", CHANNEL_ID, "routing.yaml");
+  async function getDiscordianRoutes() {
+    const routingPath = join3(process.env.HOME || ".", ".letta", "channels", CHANNEL_ID, "routing.yaml");
     let routes = [];
     try {
       const parsed = JSON.parse(await fs.readFile(routingPath, "utf8"));
       routes = Array.isArray(parsed.routes) ? parsed.routes : [];
     } catch {}
+    return { routingPath, routes };
+  }
+  async function saveDiscordianRoutes(routingPath, routes) {
+    await fs.mkdir(dirname2(routingPath), { recursive: true });
+    await fs.writeFile(routingPath, JSON.stringify({ routes }, null, 2) + `
+`, "utf8");
+  }
+  async function ensureDiscordianChannelRoute(channelId) {
+    if (!config.agentId)
+      return;
+    const { routingPath, routes } = await getDiscordianRoutes();
+    const existingRoute = routes.find((route2) => route2.accountId === config.accountId && route2.chatId === channelId && (route2.threadId ?? null) === null && route2.enabled !== false);
+    if (existingRoute)
+      return;
+    const now = new Date().toISOString();
+    const route = {
+      accountId: config.accountId,
+      chatId: channelId,
+      chatType: "channel",
+      threadId: null,
+      agentId: config.agentId,
+      conversationId: config.conversationId ?? process.env.LETTA_CONVERSATION_ID ?? "default",
+      enabled: true,
+      createdAt: now,
+      updatedAt: now
+    };
+    routes.push(route);
+    await saveDiscordianRoutes(routingPath, routes);
+    console.log("[Discordian] Created channel route", JSON.stringify({
+      accountId: config.accountId,
+      channelId,
+      agentId: route.agentId,
+      conversationId: route.conversationId
+    }));
+  }
+  async function ensureDiscordianThreadRoute(parentChannelId, threadId) {
+    if (!config.agentId)
+      return;
+    const { routingPath, routes } = await getDiscordianRoutes();
     const existingExactRoute = routes.find((route2) => route2.accountId === config.accountId && route2.chatId === threadId && route2.threadId === threadId && route2.enabled !== false);
     if (existingExactRoute)
       return;
@@ -639,9 +752,7 @@ function createDiscordAdapter(config) {
       incompleteThreadRoute.threadId = threadId;
       incompleteThreadRoute.chatType = incompleteThreadRoute.chatType ?? "channel";
       incompleteThreadRoute.updatedAt = new Date().toISOString();
-      await fs.mkdir(path.dirname(routingPath), { recursive: true });
-      await fs.writeFile(routingPath, JSON.stringify({ routes }, null, 2) + `
-`, "utf8");
+      await saveDiscordianRoutes(routingPath, routes);
       console.log("[Discordian] Migrated thread route", JSON.stringify({ accountId: config.accountId, parentChannelId, threadId }));
       return;
     }
@@ -659,9 +770,7 @@ function createDiscordAdapter(config) {
       updatedAt: now
     };
     routes.push(route);
-    await fs.mkdir(path.dirname(routingPath), { recursive: true });
-    await fs.writeFile(routingPath, JSON.stringify({ routes }, null, 2) + `
-`, "utf8");
+    await saveDiscordianRoutes(routingPath, routes);
     console.log("[Discordian] Created thread route", JSON.stringify({
       accountId: config.accountId,
       parentChannelId,
@@ -765,28 +874,32 @@ function createDiscordAdapter(config) {
           return;
         }
         const parentChannelId = message.channel.parentId ?? null;
-        const channelMode = resolveDiscordChannelMode(message.channelId, parentChannelId, isThread, config.allowedChannels);
-        const isOpenChannel = channelMode === "open";
-        if (!isThread && !wasMentioned && !isOpenChannel)
-          return;
-        if (!isDiscordGuildChannelAllowed({
+        const channelPolicy = resolveDiscordianChannelPolicy({
           channelId: message.channelId,
           parentChannelId,
           isThread,
-          allowedChannels: config.allowedChannels
-        }))
+          allowedChannels: config.allowedChannels,
+          autoThreadOnMention: config.autoThreadOnMention
+        });
+        if (!channelPolicy.allowed)
+          return;
+        const shouldTrigger = isThread || channelPolicy.trigger === "always" || channelPolicy.trigger === "mention" && wasMentioned;
+        if (!shouldTrigger)
           return;
         if (markIngressMessageSeen(message.id))
           return;
         let effectiveChatId = message.channelId;
         let effectiveThreadId = isThread ? message.channelId : null;
-        if (!isThread && wasMentioned) {
-          const createdThread = await createThreadForMention(message, content);
+        const movedTopLevelMessageToThread = !isThread && channelPolicy.conversation === "thread";
+        if (movedTopLevelMessageToThread) {
+          const createdThread = await createThreadForMessage(message, content);
           if (!createdThread)
             return;
           effectiveChatId = createdThread.id;
           effectiveThreadId = createdThread.id;
           await ensureDiscordianThreadRoute(message.channelId, createdThread.id);
+        } else if (!isThread && channelPolicy.conversation === "channel") {
+          await ensureDiscordianChannelRoute(message.channelId);
         } else if (isThread && effectiveThreadId) {
           await ensureDiscordianThreadRoute(parentChannelId ?? message.channelId, effectiveThreadId);
         }
@@ -808,7 +921,8 @@ function createDiscordAdapter(config) {
           parentChannelId: isThread ? parentChannelId ?? undefined : message.channelId,
           chatType: "channel",
           isMention: wasMentioned,
-          isOpenChannel,
+          isOpenChannel: channelPolicy.trigger === "always",
+          skipLifecycleReactions: movedTopLevelMessageToThread,
           attachments,
           raw: message
         };

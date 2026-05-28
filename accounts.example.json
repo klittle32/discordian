@@ -11,7 +11,20 @@
         "token": "YOUR_DISCORD_BOT_TOKEN",
         "agent_id": null,
         "default_permission_mode": "standard",
-        "allowed_channels": [],
+        "allowed_channels": {
+          "DISCORD_CHANNEL_REQUIRES_MENTION_TOP_LEVEL": {
+            "trigger": "mention",
+            "conversation": "channel"
+          },
+          "DISCORD_CHANNEL_AUTO_THREAD": {
+            "trigger": "always",
+            "conversation": "thread"
+          },
+          "DISCORD_CHANNEL_MENTION_THREAD": {
+            "trigger": "mention",
+            "conversation": "thread"
+          }
+        },
         "auto_thread_on_mention": true,
         "thread_policy_by_channel": {},
         "acknowledge_message_reaction": false,

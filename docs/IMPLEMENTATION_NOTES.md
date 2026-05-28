@@ -304,3 +304,76 @@ Top-level `dmPolicy`/`allowedUsers` are registry compatibility fields for the ge
 Nested `config.dm_policy`/`config.allowed_users` are Discordian's actual DM authorization policy, enforced by the adapter with Discord awareness. Bot authorization remains controlled separately by `config.respond_to_bots` and `config.allowed_bot_ids`.
 
 The interim `original_*` aliases have been removed from code and examples; use only `dm_policy` and `allowed_users` under `config`.
+
+## Per-channel trigger and conversation policies
+
+Discordian now supports a richer per-channel `allowed_channels` object form that separates when the agent is triggered from where the agent conversation lives.
+
+Preferred form:
+
+```json
+{
+  "allowed_channels": {
+    "DISCORD_CHANNEL_A": {
+      "trigger": "mention",
+      "conversation": "channel"
+    },
+    "DISCORD_CHANNEL_B": {
+      "trigger": "always",
+      "conversation": "thread"
+    },
+    "DISCORD_CHANNEL_C": {
+      "trigger": "mention",
+      "conversation": "thread"
+    }
+  }
+}
+```
+
+`trigger` controls top-level channel messages:
+
+- `mention`: require a Discordian bot mention.
+- `always`: allow any authorized sender message without a mention.
+- `never`: explicitly disable the channel.
+
+`conversation` controls placement after a message triggers:
+
+- `channel`: keep the agent conversation in the top-level Discord channel.
+- `thread`: create/use a Discord thread and route replies there.
+
+This makes Needle unnecessary for channels configured as:
+
+```json
+"DISCORD_CHANNEL_ID": { "trigger": "always", "conversation": "thread" }
+```
+
+Legacy mappings are preserved:
+
+- `allowed_channels: ["CHANNEL_ID"]` maps to mention-triggered behavior, with `conversation` derived from `auto_thread_on_mention`.
+- `"mention"` / `"mention-only"` maps to mention-triggered behavior, with `conversation` derived from `auto_thread_on_mention`.
+- `"open"` maps to `{ "trigger": "always", "conversation": "channel" }` for compatibility; no-mention auto-threading requires explicit object form.
+- `true` maps to conservative mention-triggered behavior.
+- `false`, `"off"`, `"never"`, and `"disabled"` disable the channel.
+
+Default policy semantics are intentionally conservative:
+
+- missing, null, or empty `allowed_channels` allows guild messages but treats top-level messages as mention-triggered and keeps conversations in the top-level channel;
+- legacy allowlist entries are also mention-triggered, but preserve the historical `auto_thread_on_mention` placement behavior.
+
+The asymmetry is deliberate: an unconstrained empty config should not unexpectedly create threads, while legacy configs should keep their prior thread-on-mention behavior.
+
+For `conversation: "channel"`, Discordian auto-creates a top-level channel route when `agent_id` is configured. For `conversation: "thread"`, Discordian reuses the existing exact thread route creation/migration path.
+
+Existing thread messages under an allowed parent channel use permissive route repair. If the exact `(accountId, chatId: threadId, threadId)` route is missing, Discordian creates or migrates it before forwarding the message. This intentionally keeps externally-created Discord/Needle threads working without manual route edits. Reaction events currently follow the same parent-channel allow/deny gate for thread messages; `conversation: "channel"` does not suppress reactions in existing threads.
+
+## Operational note: duplicate listeners
+
+Discord delivers events to every logged-in client for the same bot. During development, running two `letta server --channels discordian` listeners against the same account causes duplicate inbound deliveries. The adapter's `markIngressMessageSeen(...)` dedupe is process-local and cannot dedupe across multiple listener processes.
+
+Check before live tests:
+
+```bash
+ps aux | grep 'letta server --debug --env-name discordian-test --channels discordian' | grep -v grep
+```
+
+Kill duplicate listeners and restart exactly one if duplicates appear.

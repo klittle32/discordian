@@ -174,3 +174,417 @@ Meaning:
 4. `accounts.example.json` uses the simplified shape.
 5. Docs explain registry-open compatibility and adapter-owned Discordian policy.
 6. `plugin.mjs` was rebuilt and live-tested after deployment.
+
+## Next enhancement: per-channel trigger and conversation policies
+
+Goal: make Needle unnecessary in channels where Discordian should create agent threads itself, while still supporting channels that require mentions and/or top-level replies.
+
+The important design change is to separate two concepts that are currently tangled together:
+
+1. **Trigger policy** — when should the agent engage with a top-level channel message?
+2. **Conversation placement** — where should the agent conversation happen once triggered?
+
+This lets different Discord channels behave differently without rewriting the thread creation machinery.
+
+### Target config model
+
+Prefer an object form under `config.allowed_channels`:
+
+```json
+{
+  "allowed_channels": {
+    "DISCORD_CHANNEL_A": {
+      "trigger": "mention",
+      "conversation": "channel"
+    },
+    "DISCORD_CHANNEL_B": {
+      "trigger": "always",
+      "conversation": "thread"
+    },
+    "DISCORD_CHANNEL_C": {
+      "trigger": "mention",
+      "conversation": "thread"
+    }
+  }
+}
+```
+
+Semantics:
+
+- `trigger: "mention"`: a top-level channel message triggers the agent only if the Discordian bot is mentioned.
+- `trigger: "always"`: any allowed top-level channel message from an authorized sender triggers the agent; no mention required.
+- `trigger: "never"`: explicit disable for a channel.
+- `conversation: "channel"`: keep the conversation in the top-level Discord channel; replies are top-level channel replies.
+- `conversation: "thread"`: create/use a Discord thread and route the agent conversation there.
+
+Example use cases:
+
+- Channel A requires mentioning, and the agent replies at top level:
+
+```json
+"DISCORD_CHANNEL_A": { "trigger": "mention", "conversation": "channel" }
+```
+
+- Channel B does not require mentioning, and Discordian creates a thread automatically:
+
+```json
+"DISCORD_CHANNEL_B": { "trigger": "always", "conversation": "thread" }
+```
+
+- Channel C requires mentioning, and Discordian creates a thread after the mention:
+
+```json
+"DISCORD_CHANNEL_C": { "trigger": "mention", "conversation": "thread" }
+```
+
+### Backward compatibility
+
+Keep existing `allowed_channels` forms working.
+
+Array form remains conservative:
+
+```json
+"allowed_channels": ["DISCORD_CHANNEL_ID"]
+```
+
+Map to:
+
+```json
+{ "trigger": "mention", "conversation": "thread" }
+```
+
+when `auto_thread_on_mention` is true, and to:
+
+```json
+{ "trigger": "mention", "conversation": "channel" }
+```
+
+when `auto_thread_on_mention` is false.
+
+String/object legacy modes should also continue to work:
+
+```json
+"allowed_channels": {
+  "DISCORD_CHANNEL_A": "mention",
+  "DISCORD_CHANNEL_B": "open"
+}
+```
+
+Suggested mapping:
+
+- `"mention"` -> `{ "trigger": "mention", "conversation": auto_thread_on_mention ? "thread" : "channel" }`
+- `"open"` -> `{ "trigger": "always", "conversation": "channel" }`
+- `true` -> same as `"mention"` for conservative compatibility
+- `false` -> `{ "trigger": "never", "conversation": "channel" }`
+
+Important: legacy `"open"` should not automatically imply auto-threading, because that would remove the valid behavior where an agent simply replies in the top-level channel. Users opt into no-mention auto-threading with the new object form:
+
+```json
+"DISCORD_CHANNEL_ID": { "trigger": "always", "conversation": "thread" }
+```
+
+### Internal model
+
+Introduce a normalized channel policy type:
+
+```ts
+type DiscordianChannelTrigger = "mention" | "always" | "never";
+type DiscordianConversationPlacement = "channel" | "thread";
+
+type DiscordianChannelPolicy = {
+  allowed: boolean;
+  trigger: DiscordianChannelTrigger;
+  conversation: DiscordianConversationPlacement;
+};
+```
+
+Add a resolver that replaces/augments `resolveDiscordChannelMode(...)`:
+
+```ts
+function resolveDiscordianChannelPolicy(options: {
+  channelId: string;
+  parentChannelId?: string | null;
+  isThread: boolean;
+  allowedChannels: unknown;
+  autoThreadOnMention: boolean;
+}): DiscordianChannelPolicy;
+```
+
+Resolver requirements:
+
+- For top-level messages, resolve policy from `message.channelId`.
+- For thread messages, resolve policy from `parentChannelId` when available.
+- Preserve current behavior for array and string forms.
+- Validate unsupported object values by falling back safely to disabled or conservative mention behavior.
+
+### Guild-message flow after refactor
+
+Current logic uses `wasMentioned` and `isOpenChannel`. Replace that with policy-driven logic:
+
+```ts
+const policy = resolveDiscordianChannelPolicy({
+  channelId: message.channelId,
+  parentChannelId,
+  isThread,
+  allowedChannels: config.allowedChannels,
+  autoThreadOnMention: config.autoThreadOnMention,
+});
+
+if (!policy.allowed) return;
+
+const shouldTrigger =
+  isThread ||
+  policy.trigger === "always" ||
+  (policy.trigger === "mention" && wasMentioned);
+
+if (!shouldTrigger) return;
+```
+
+Then place the conversation:
+
+```ts
+let effectiveChatId = message.channelId;
+let effectiveThreadId = isThread ? message.channelId : null;
+
+if (!isThread && policy.conversation === "thread") {
+  const createdThread = await createThreadForMessage(message, content);
+  if (!createdThread) return;
+  effectiveChatId = createdThread.id;
+  effectiveThreadId = createdThread.id;
+  await ensureDiscordianThreadRoute(message.channelId, createdThread.id);
+} else if (!isThread && policy.conversation === "channel") {
+  await ensureDiscordianChannelRoute(message.channelId);
+} else if (isThread && effectiveThreadId) {
+  await ensureDiscordianThreadRoute(parentChannelId ?? message.channelId, effectiveThreadId);
+}
+```
+
+Mention normalization remains mention-specific:
+
+```ts
+const normalizedText = wasMentioned
+  ? normalizeDiscordMentionText(content, botUserId)
+  : content;
+```
+
+### Route helpers
+
+The existing thread route helper should stay and be reused:
+
+```ts
+ensureDiscordianThreadRoute(parentChannelId, threadId)
+```
+
+Add a sibling helper for top-level channel conversations:
+
+```ts
+ensureDiscordianChannelRoute(channelId)
+```
+
+It should persist a route shape like:
+
+```json
+{
+  "accountId": "main",
+  "chatId": "DISCORD_CHANNEL_ID",
+  "chatType": "channel",
+  "threadId": null,
+  "agentId": "...",
+  "conversationId": "...",
+  "enabled": true
+}
+```
+
+This is needed for `conversation: "channel"` so the generic custom-channel registry can deliver top-level channel messages without manual route setup.
+
+### Naming cleanup
+
+Rename the existing mention-specific helper:
+
+```ts
+createThreadForMention(...)
+```
+
+to:
+
+```ts
+createThreadForMessage(...)
+```
+
+because it will now be used for both mention-triggered and always-triggered auto-threading.
+
+Update the Discord audit reason from mention-specific wording to generic Discordian auto-thread wording.
+
+### Documentation updates
+
+Update `accounts.example.json` to show the new object form, likely with comments impossible in JSON so use representative IDs:
+
+```json
+"allowed_channels": {
+  "DISCORD_CHANNEL_REQUIRES_MENTION_TOP_LEVEL": {
+    "trigger": "mention",
+    "conversation": "channel"
+  },
+  "DISCORD_CHANNEL_AUTO_THREAD": {
+    "trigger": "always",
+    "conversation": "thread"
+  },
+  "DISCORD_CHANNEL_MENTION_THREAD": {
+    "trigger": "mention",
+    "conversation": "thread"
+  }
+}
+```
+
+Also update implementation notes to describe the new policy model and the legacy mappings.
+
+### Acceptance tests
+
+Use one test channel initially by changing config between cases, or use three channels if convenient.
+
+1. `trigger: "mention", conversation: "channel"`
+   - top-level non-mention is ignored;
+   - top-level mention reaches the agent;
+   - agent reply appears in top-level channel;
+   - no Discord thread is created.
+
+2. `trigger: "always", conversation: "thread"`
+   - top-level non-mention creates a Discord thread;
+   - exact thread route is created automatically;
+   - agent reply appears in the created thread;
+   - Needle is not involved.
+
+3. `trigger: "mention", conversation: "thread"`
+   - top-level non-mention is ignored;
+   - top-level mention creates a Discord thread;
+   - agent reply appears in the created thread.
+
+4. Existing thread messages
+   - never create nested threads;
+   - use parent channel policy for authorization/route inheritance;
+   - ensure exact thread routes still exist.
+
+5. Legacy config compatibility
+   - array form still behaves like mention-triggered channels;
+   - legacy `"open"` still permits no-mention top-level messages without forcing auto-threading;
+   - legacy `"mention"` still requires a mention.
+
+6. Bot/self behavior
+   - Discordian still ignores itself;
+   - `respond_to_bots` continues to control whether bot messages can trigger policies.
+
+### Implementation order
+
+1. Add normalized channel policy resolver and unit/smoke checks where practical.
+2. Refactor guild-message flow to use policy while preserving current behavior for existing config.
+3. Add object-form policy support.
+4. Add `ensureDiscordianChannelRoute(...)` for top-level channel conversations.
+5. Rename `createThreadForMention` to `createThreadForMessage`.
+6. Update docs/examples.
+7. Rebuild, deploy, and live-test the three policy combinations.
+8. Commit after live validation.
+
+## Resume plan: cleanup and validation after live auto-thread test
+
+Status at pause:
+
+- Source edits are in `~/Code/discordian/`.
+- Runtime copy was deployed to `~/.letta/channels/discordian/` during testing.
+- Latest live validation for `trigger: "always", conversation: "thread"` succeeded:
+  - fresh top-level message created an exact thread route;
+  - agent turn was delivered to the created thread;
+  - lifecycle `Unknown Message` warning did not recur after the starter-message lifecycle skip fix.
+- Low-risk cleanup already applied:
+  - lifecycle skip logic extracted into `shouldSkipLifecycleReaction(source)`;
+  - stale `shouldAutoThreadOnDiscordMention(...)` removed;
+  - route file helpers typed with `DiscordianRoute` / `DiscordianRoutesFile`;
+  - route file imports moved to top-level;
+  - thread-already-created check extracted into `isDiscordThreadAlreadyExistsError(error)`;
+  - `plugin.mjs` rebuilt from source.
+
+### Remaining cleanup/design items
+
+1. Clarify default policy semantics.
+   - Current defaults are intentionally conservative but subtle:
+     - no/empty `allowedChannels` means allowed, mention-triggered, channel conversation;
+     - legacy string-array allowlist entries mean allowed, mention-triggered, conversation derived from `autoThreadOnMention`.
+   - Decide whether this asymmetry is desired and document it clearly in README / implementation notes.
+
+2. Use full resolved policy consistently for reaction events.
+   - Reaction handling currently checks only `isDiscordGuildChannelAllowed(...)` / `.allowed` for the parent channel.
+   - Decide whether `conversation: "channel"` should suppress thread reaction events, or whether reactions in existing threads should remain allowed whenever the parent channel is allowed.
+   - If stricter behavior is desired, change reaction handling to call `resolveDiscordianChannelPolicy(...)` and inspect `conversation` / `trigger` as appropriate.
+
+3. Decide how broad automatic exact thread-route creation should be.
+   - Current behavior creates/migrates an exact thread route for any allowed inbound thread message before forwarding.
+   - This is useful for externally-created Discord/Needle threads, but may be too permissive if a parent channel is only configured for top-level mention/channel conversations.
+   - Possible stricter gates:
+     - only create exact routes for threads under channels with `conversation: "thread"`;
+     - only create exact routes when the message mentions the bot;
+     - only create exact routes when a parent channel route already exists;
+     - keep current behavior and document it as Discordian's route-repair behavior.
+
+4. Consider stronger detection for Discord's "thread already created" error.
+   - The fallback is isolated in `isDiscordThreadAlreadyExistsError(error)`, but still string-matches Discord's error message.
+   - If discord.js exposes a stable error code for this case, prefer that.
+
+5. Clean up docs before commit.
+   - `docs/PLAN.md` is currently large and contains implementation-order notes that are partly complete.
+   - Keep durable behavior and config semantics in `docs/IMPLEMENTATION_NOTES.md` and/or README.
+   - Optionally trim completed planning prose before the final commit.
+
+6. Run focused smoke validation after any further edits.
+   - Rebuild `plugin.mjs` after source changes.
+   - Deploy to `~/.letta/channels/discordian/` and restart the listener.
+   - Re-test at least:
+     - `trigger: "always", conversation: "thread"` fresh top-level message;
+     - `trigger: "mention", conversation: "channel"` top-level mention/no-mention behavior if convenient;
+     - existing thread reply route behavior.
+
+### Suggested next steps
+
+1. Review current diff and decide whether default policy semantics are final.
+2. Decide on strict vs permissive auto-route creation for existing threads.
+3. Update docs to match those decisions.
+4. Rebuild/deploy and run one final live smoke test.
+5. Commit source + rebuilt `plugin.mjs` once validated.
+
+### Duplicate delivery note
+
+A duplicate-delivery symptom appeared after repeated listener restarts/testing. Investigation showed two `letta server --debug --env-name discordian-test --channels discordian` processes were running concurrently (`45447` and `45702`). That can cause multiple Discord clients to receive the same Discord event and enqueue duplicate channel turns.
+
+Mitigation applied before pausing:
+
+- killed all matching `discordian-test` listener processes;
+- redeployed the rebuilt plugin from `~/Code/discordian/` to `~/.letta/channels/discordian/`;
+- reinstalled the channel;
+- restarted a single listener process.
+
+Current single listener PID after cleanup: `46161`.
+
+If duplicates recur, first check for multiple listeners:
+
+```bash
+ps aux | grep 'letta server --debug --env-name discordian-test --channels discordian' | grep -v grep
+```
+
+If more than one exists, kill all matching listeners and restart exactly one. The in-adapter `markIngressMessageSeen(...)` dedupe only works within one process; it cannot dedupe Discord events received by multiple concurrently-running listener processes.
+
+### Final smoke validation after docs/rebuild
+
+After documenting the final policy decisions, rebuilding `plugin.mjs`, redeploying to `~/.letta/channels/discordian/`, reinstalling the channel, and restarting exactly one `discordian-test` listener, the following live Discord smoke tests passed:
+
+- No-mention top-level message in the configured auto-thread channel created a Discord thread and exact Discordian route.
+  - message/thread id: `1509537618696736841`
+  - parent channel id: `1509348071664779334`
+- Mentioned top-level message in the same channel also created a Discord thread and exact Discordian route.
+  - message/thread id: `1509537840214839438`
+  - parent channel id: `1509348071664779334`
+- Each test produced one normal protocol delivery path (`update_queue` then `stream_delta`) with only one listener process running.
+- No lifecycle `Unknown Message` warnings appeared for either fresh starter-message thread.
+- Earlier same-day voice/no-tag delivery also reached the agent and transcription worked via the external transcribe skill.
+
+Current validation state: ready to commit after final diff review.
+- Mention inside an existing Discordian-created thread routed through the existing thread route without creating a nested thread.
+  - message id: `1509538042665373797`
+  - thread id: `1509537840214839438`
