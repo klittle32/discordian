@@ -36,8 +36,10 @@ Routes are stored in the channel `routing.yaml` file using JSON content. Discord
 
 Route creation requires a Letta API key available to the listener process because step 1 calls the public Letta API:
 
-- preferred: `DISCORDIAN_LETTA_API_KEY`
-- fallback: nested `config.discordian_letta_api_key`
+- preferred: `DISCORDIAN_LETTA_API_KEY` exported into the `letta server --channels discordian` process environment;
+- fallback: nested `config.discordian_letta_api_key`.
+
+Operational finding: Letta Cloud/Letta Code agent secrets available to the interactive agent/tool runtime do not automatically flow through to a separately launched `letta server` listener or its custom-channel plugin process. In local testing, removing `config.discordian_letta_api_key` and starting the listener without explicitly exporting `DISCORDIAN_LETTA_API_KEY` produced `credentialSource":"missing"` in the plugin startup log. Starting the listener with `DISCORDIAN_LETTA_API_KEY` in that process environment produced `credentialSource":"DISCORDIAN_LETTA_API_KEY"`.
 
 The Letta base URL follows `LETTA_BASE_URL` when set and otherwise defaults to `https://api.letta.com`.
 

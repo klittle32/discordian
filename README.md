@@ -87,11 +87,13 @@ Keep these top-level fields open unless you intentionally want Letta Code's gene
 
 Discordian needs a Letta API key because custom channels do not receive the internal route/conversation helper functions that the native Discord channel uses. The key is used only by the listener to create new Letta conversations for newly seen Discord channels, threads, and DMs.
 
-Preferred option:
+Preferred option for process managers or shells that launch the listener:
 
 ```bash
 export DISCORDIAN_LETTA_API_KEY="<LETTA_API_KEY>"
 ```
+
+Make sure the variable is exported in the same environment that starts `letta server --channels discordian`. Letta Cloud/Letta Code agent secrets available to tool calls do **not** automatically flow through to a separately launched `letta server` listener or its channel plugin process. If the listener log reports `credentialSource":"missing"`, either export the variable for that process or use the config fallback below.
 
 Local/testing fallback inside `accounts.json`:
 
@@ -211,13 +213,15 @@ Discordian runs as an external custom-channel plugin under the channel id `disco
 2. It writes the corresponding Discordian route to this channel's `routing.yaml`.
 3. It forwards the inbound message only after the route exists, so Letta Code's generic custom-channel registry can deliver the turn normally.
 
-That public API call is why the listener needs a Letta API key. Prefer the environment variable:
+That public API call is why the listener needs a Letta API key. Prefer an environment variable exported into the listener process:
 
 ```bash
 export DISCORDIAN_LETTA_API_KEY="<LETTA_API_KEY>"
 ```
 
-For quick local testing, you may put the key in nested account config instead:
+This must be present in the environment of the `letta server --channels discordian` process itself. Letta Cloud/Letta Code agent secrets that are available to the interactive agent/tool runtime are not automatically inherited by a separately launched listener or custom-channel plugin process. Check the startup log line for `credentialSource`; it should say `DISCORDIAN_LETTA_API_KEY` or `config.discordian_letta_api_key`, not `missing`.
+
+For quick local testing, or when your process manager cannot inject the variable, you may put the key in nested account config instead:
 
 ```json
 {
