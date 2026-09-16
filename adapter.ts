@@ -1,5 +1,5 @@
-import { promises as fs } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { basename, join } from "node:path";
+import { readRoutingStore, writeRoutingStore, withRoutingStoreLock } from "./routing-store";
 import {
   resolveDiscordianEffectiveChannelConfig,
 } from "./channel-gating";
@@ -134,27 +134,9 @@ interface DiscordClient {
   destroy: () => void;
 }
 
-interface DiscordianRoute {
-  accountId?: string;
-  chatId?: string;
-  chatType?: string;
-  threadId?: string | null;
-  agentId?: string | null;
-  conversationId?: string | null;
-  enabled?: boolean;
-  createdAt?: string;
-  updatedAt?: string;
-}
-
-interface DiscordianRoutesFile {
-  routes?: DiscordianRoute[];
-}
-
 interface LettaConversationCreateResponse {
   id?: string;
 }
-
-type DiscordianRouteLockKey = string;
 
 // Mirrors first-party Letta Code channel conversation creation. The current
 // bundled value is empty, but keep the field explicit so parity is obvious and
@@ -454,7 +436,6 @@ export function createDiscordAdapter(
   >();
   const lifecycleOperationByMessageKey = new Map<string, Promise<void>>();
   const lifecycleErrorReplyKeys = new Map<string, number>();
-  const discordianRouteLocks = new Map<DiscordianRouteLockKey, Promise<void>>();
   const typingByChatId = new Map<DiscordTypingTargetId, DiscordTypingState>();
   const typingIndicatorEnabled = resolveBooleanConfig(
     config.typingIndicator ?? config.typing_indicator,
@@ -917,56 +898,8 @@ export function createDiscordAdapter(
     }
   }
 
-  async function getDiscordianRoutes(): Promise<{
-    routingPath: string;
-    routes: DiscordianRoute[];
-  }> {
-    // Letta custom-channel routing files use JSON content in routing.yaml.
-    const routingPath = join(
-      process.env.HOME || ".",
-      ".letta",
-      "channels",
-      CHANNEL_ID,
-      "routing.yaml",
-    );
-    let routes: DiscordianRoute[] = [];
-    try {
-      const parsed = JSON.parse(
-        await fs.readFile(routingPath, "utf8"),
-      ) as DiscordianRoutesFile;
-      routes = Array.isArray(parsed.routes) ? parsed.routes : [];
-    } catch {}
-    return { routingPath, routes };
-  }
-
-  async function saveDiscordianRoutes(
-    routingPath: string,
-    routes: DiscordianRoute[],
-  ): Promise<void> {
-    await fs.mkdir(dirname(routingPath), { recursive: true });
-    const tmpPath = `${routingPath}.${process.pid}.${Date.now()}.tmp`;
-    await fs.writeFile(
-      tmpPath,
-      JSON.stringify({ routes }, null, 2) + "\n",
-      "utf8",
-    );
-    await fs.rename(tmpPath, routingPath);
-  }
-
-  async function runDiscordianRouteLocked(
-    key: DiscordianRouteLockKey,
-    operation: () => Promise<void>,
-  ): Promise<void> {
-    const previous = discordianRouteLocks.get(key) ?? Promise.resolve();
-    const next = previous.catch(() => undefined).then(operation);
-    discordianRouteLocks.set(key, next);
-    try {
-      await next;
-    } finally {
-      if (discordianRouteLocks.get(key) === next) {
-        discordianRouteLocks.delete(key);
-      }
-    }
+  function routingDirectory(): string {
+    return join(process.env.HOME || ".", ".letta", "channels", CHANNEL_ID);
   }
 
   async function createDiscordianConversationRouteTarget(input: {
@@ -1021,9 +954,9 @@ export function createDiscordAdapter(
     // Discordian route mutations in-process, not just identical chat ids, so
     // concurrent first messages in different channels/threads do not overwrite
     // each other's newly-added routes.
-    const lockKey = `${config.accountId}:routes`;
-    await runDiscordianRouteLocked(lockKey, async () => {
-      const { routingPath, routes } = await getDiscordianRoutes();
+    await withRoutingStoreLock(routingDirectory(), async () => {
+      const store = await readRoutingStore(routingDirectory());
+      const { routes } = store.document;
       const existingRoute = routes.find(
         (route) =>
           route.accountId === config.accountId &&
@@ -1067,7 +1000,7 @@ export function createDiscordAdapter(
         updatedAt: now,
       };
       routes.push(route);
-      await saveDiscordianRoutes(routingPath, routes);
+      await writeRoutingStore(store);
       console.log(
         "[Discordian] Created channel route",
         JSON.stringify({
@@ -1085,9 +1018,9 @@ export function createDiscordAdapter(
     // Direct-message chats need a persisted route before the first inbound DM is
     // forwarded, otherwise the generic custom-channel registry reports that the
     // chat is not connected to a Letta agent yet.
-    const lockKey = `${config.accountId}:routes`;
-    await runDiscordianRouteLocked(lockKey, async () => {
-      const { routingPath, routes } = await getDiscordianRoutes();
+    await withRoutingStoreLock(routingDirectory(), async () => {
+      const store = await readRoutingStore(routingDirectory());
+      const { routes } = store.document;
       const existingRoute = routes.find(
         (route) =>
           route.accountId === config.accountId &&
@@ -1131,7 +1064,7 @@ export function createDiscordAdapter(
         updatedAt: now,
       };
       routes.push(route);
-      await saveDiscordianRoutes(routingPath, routes);
+      await writeRoutingStore(store);
       console.log(
         "[Discordian] Created DM route",
         JSON.stringify({
@@ -1153,9 +1086,9 @@ export function createDiscordAdapter(
     // Discordian route mutations in-process, not just identical chat ids, so
     // concurrent first messages in different channels/threads do not overwrite
     // each other's newly-added routes.
-    const lockKey = `${config.accountId}:routes`;
-    await runDiscordianRouteLocked(lockKey, async () => {
-      const { routingPath, routes } = await getDiscordianRoutes();
+    await withRoutingStoreLock(routingDirectory(), async () => {
+      const store = await readRoutingStore(routingDirectory());
+      const { routes } = store.document;
       const existingExactRoute = routes.find(
         (route) =>
           route.accountId === config.accountId &&
@@ -1176,7 +1109,7 @@ export function createDiscordAdapter(
         incompleteThreadRoute.threadId = threadId;
         incompleteThreadRoute.chatType = incompleteThreadRoute.chatType ?? "channel";
         incompleteThreadRoute.updatedAt = new Date().toISOString();
-        await saveDiscordianRoutes(routingPath, routes);
+        await writeRoutingStore(store);
         console.log(
           "[Discordian] Migrated thread route",
           JSON.stringify({ accountId: config.accountId, parentChannelId, threadId }),
@@ -1220,7 +1153,7 @@ export function createDiscordAdapter(
         updatedAt: now,
       };
       routes.push(route);
-      await saveDiscordianRoutes(routingPath, routes);
+      await writeRoutingStore(store);
       console.log(
         "[Discordian] Created thread route",
         JSON.stringify({

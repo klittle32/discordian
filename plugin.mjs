@@ -1,24 +1,4 @@
-var __defProp = Object.defineProperty;
-var __returnValue = (v) => v;
-function __exportSetter(name, newValue) {
-  this[name] = __returnValue.bind(null, newValue);
-}
-var __export = (target, all) => {
-  for (var name in all)
-    __defProp(target, name, {
-      get: all[name],
-      enumerable: true,
-      configurable: true,
-      set: __exportSetter.bind(all, name)
-    });
-};
-
 // transcription-stub.mjs
-var exports_transcription_stub = {};
-__export(exports_transcription_stub, {
-  transcribeAudioFile: () => transcribeAudioFile,
-  isTranscriptionConfigured: () => isTranscriptionConfigured
-});
 function isTranscriptionConfigured() {
   return false;
 }
@@ -27,8 +7,97 @@ async function transcribeAudioFile() {
 }
 
 // adapter.ts
+import { basename, join as join4 } from "node:path";
+
+// routing-store.ts
+import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
-import { basename, dirname as dirname2, join as join3 } from "node:path";
+import { dirname, join, resolve } from "node:path";
+function isObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+function validateDocument(value, path) {
+  if (!isObject(value) || !Array.isArray(value.routes)) {
+    throw new Error(`Invalid routing store ${path}: expected an object with a routes array`);
+  }
+  for (const route of value.routes) {
+    if (!isObject(route))
+      throw new Error(`Invalid route in ${path}: expected an object`);
+    for (const key of ["accountId", "chatId", "chatType", "createdAt", "updatedAt"]) {
+      if (key in route && typeof route[key] !== "string") {
+        throw new Error(`Invalid route ${key} in ${path}: expected a string`);
+      }
+    }
+    for (const key of ["threadId", "agentId", "conversationId"]) {
+      if (key in route && route[key] !== null && typeof route[key] !== "string") {
+        throw new Error(`Invalid route ${key} in ${path}: expected a string or null`);
+      }
+    }
+    if ("enabled" in route && typeof route.enabled !== "boolean") {
+      throw new Error(`Invalid route enabled in ${path}: expected a boolean`);
+    }
+  }
+}
+async function readDocument(path) {
+  let text;
+  try {
+    text = await fs.readFile(path, "utf8");
+  } catch (error) {
+    if (error.code === "ENOENT")
+      return;
+    throw error;
+  }
+  let document;
+  try {
+    document = JSON.parse(text);
+  } catch (error) {
+    throw new Error(`Invalid JSON in routing store ${path}`, { cause: error });
+  }
+  validateDocument(document, path);
+  return document;
+}
+async function readRoutingStore(directory) {
+  const routingPath = resolve(directory, "routing.json");
+  const document = await readDocument(routingPath) ?? await readDocument(join(directory, "routing.yaml")) ?? { routes: [] };
+  return { routingPath, document };
+}
+async function writeRoutingStore(store) {
+  validateDocument(store.document, store.routingPath);
+  const text = JSON.stringify(store.document, null, 2) + `
+`;
+  await fs.mkdir(dirname(store.routingPath), { recursive: true, mode: 448 });
+  const temporaryPath = `${store.routingPath}.${process.pid}.${randomUUID()}.tmp`;
+  let created = false;
+  try {
+    const handle = await fs.open(temporaryPath, "wx", 384);
+    created = true;
+    try {
+      await handle.writeFile(text, "utf8");
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    await fs.rename(temporaryPath, store.routingPath);
+  } finally {
+    if (created)
+      await fs.rm(temporaryPath, { force: true });
+  }
+}
+var storeLocks = new Map;
+async function withRoutingStoreLock(directory, operation) {
+  const key = resolve(directory, "routing.json");
+  const previous = storeLocks.get(key) ?? Promise.resolve();
+  const next = previous.catch(() => {
+    return;
+  }).then(operation);
+  storeLocks.set(key, next);
+  try {
+    return await next;
+  } finally {
+    if (storeLocks.get(key) === next)
+      storeLocks.delete(key);
+  }
+}
 
 // channel-gating.ts
 function resolveGateChannelId(channelId, parentChannelId, isThread) {
@@ -131,13 +200,13 @@ function formatDiscordDeliveryError(error) {
 }
 
 // media.ts
-import { randomUUID } from "node:crypto";
+import { randomUUID as randomUUID2 } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join as join2 } from "node:path";
 var DISCORD_ATTACHMENT_DOWNLOAD_TIMEOUT_MS = 15000;
-var DISCORD_ATTACHMENTS_DIR = join(tmpdir(), "letta-discord-attachments");
+var DISCORD_ATTACHMENTS_DIR = join2(tmpdir(), "letta-discord-attachments");
 var MAX_DISCORD_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 function ensureAttachmentsDir() {
   mkdirSync(DISCORD_ATTACHMENTS_DIR, { recursive: true });
@@ -169,13 +238,13 @@ async function resolveDiscordInboundAttachments(params) {
     const kind = resolveAttachmentKind(attachment.contentType);
     const localFileName = [
       Date.now(),
-      randomUUID(),
+      randomUUID2(),
       sanitizeDiscordPathSegment(params.accountId),
       sanitizeDiscordPathSegment(params.chatId),
       sanitizeDiscordPathSegment(attachment.id),
       sanitizeDiscordPathSegment(name)
     ].join("-");
-    const localPath = join(dir, localFileName);
+    const localPath = join2(dir, localFileName);
     try {
       const controller = new AbortController;
       const timeout = setTimeout(() => controller.abort(), DISCORD_ATTACHMENT_DOWNLOAD_TIMEOUT_MS);
@@ -213,9 +282,9 @@ async function resolveDiscordInboundAttachments(params) {
         entry.imageDataBase64 = buffer.toString("base64");
       }
       if (kind === "audio" && params.transcribeVoice) {
-        const { isTranscriptionConfigured: isTranscriptionConfigured2, transcribeAudioFile: transcribeAudioFile2 } = await Promise.resolve().then(() => exports_transcription_stub);
-        if (isTranscriptionConfigured2()) {
-          const result = await transcribeAudioFile2(localPath);
+        await Promise.resolve();
+        if (isTranscriptionConfigured()) {
+          const result = await transcribeAudioFile(localPath);
           if (result.success && result.text) {
             entry.transcription = result.text;
           }
@@ -231,16 +300,16 @@ async function resolveDiscordInboundAttachments(params) {
 
 // runtime.mjs
 import { createRequire } from "node:module";
-import { dirname, join as join2 } from "node:path";
+import { dirname as dirname2, join as join3 } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 var CHANNEL_ID = "discordian";
 var DISPLAY_NAME = "Discordian";
-var __dirname2 = dirname(fileURLToPath(import.meta.url));
+var __dirname2 = dirname2(fileURLToPath(import.meta.url));
 async function loadDiscordModule() {
   const require2 = createRequire(import.meta.url);
   const candidates = [
-    join2(__dirname2, "runtime", "package.json"),
-    join2(__dirname2, "package.json")
+    join3(__dirname2, "runtime", "package.json"),
+    join3(__dirname2, "package.json")
   ];
   for (const candidate of candidates) {
     try {
@@ -426,7 +495,6 @@ function createDiscordAdapter(config) {
   const lifecycleStateByMessageKey = new Map;
   const lifecycleOperationByMessageKey = new Map;
   const lifecycleErrorReplyKeys = new Map;
-  const discordianRouteLocks = new Map;
   const typingByChatId = new Map;
   const typingIndicatorEnabled = resolveBooleanConfig(config.typingIndicator ?? config.typing_indicator, DISCORD_TYPING_INDICATOR_DEFAULT);
   const typingRefreshMs = resolveMillisecondsConfig(config.typingIndicatorRefreshMs ?? config.typing_indicator_refresh_ms, DISCORD_TYPING_REFRESH_MS_DEFAULT, DISCORD_TYPING_REFRESH_MS_MIN, DISCORD_TYPING_REFRESH_MS_MAX);
@@ -460,7 +528,7 @@ function createDiscordAdapter(config) {
     seenIngressMessageKeys.set(key, now + INGRESS_DEDUPE_TTL_MS);
     return false;
   }
-  function normalizedStringList2(value) {
+  function normalizedStringList(value) {
     return Array.isArray(value) ? value.filter((item) => typeof item === "string" && item.trim().length > 0) : [];
   }
   function isSelfDiscordUser(user) {
@@ -471,7 +539,7 @@ function createDiscordAdapter(config) {
       return true;
     if (options.respondToBots !== true)
       return false;
-    const allowedBotIds = normalizedStringList2(options.allowedBotIds);
+    const allowedBotIds = normalizedStringList(options.allowedBotIds);
     if (allowedBotIds.length === 0)
       return true;
     return allowedBotIds.includes(user.id);
@@ -487,7 +555,7 @@ function createDiscordAdapter(config) {
     }
     const discordianDmPolicy = config.discordianDmPolicy ?? config.dmPolicy;
     if (discordianDmPolicy === "allowlist") {
-      return normalizedStringList2(config.discordianAllowedUsers).includes(user.id);
+      return normalizedStringList(config.discordianAllowedUsers).includes(user.id);
     }
     return true;
   }
@@ -783,35 +851,8 @@ function createDiscordAdapter(config) {
       return null;
     }
   }
-  async function getDiscordianRoutes() {
-    const routingPath = join3(process.env.HOME || ".", ".letta", "channels", CHANNEL_ID, "routing.yaml");
-    let routes = [];
-    try {
-      const parsed = JSON.parse(await fs.readFile(routingPath, "utf8"));
-      routes = Array.isArray(parsed.routes) ? parsed.routes : [];
-    } catch {}
-    return { routingPath, routes };
-  }
-  async function saveDiscordianRoutes(routingPath, routes) {
-    await fs.mkdir(dirname2(routingPath), { recursive: true });
-    const tmpPath = `${routingPath}.${process.pid}.${Date.now()}.tmp`;
-    await fs.writeFile(tmpPath, JSON.stringify({ routes }, null, 2) + `
-`, "utf8");
-    await fs.rename(tmpPath, routingPath);
-  }
-  async function runDiscordianRouteLocked(key, operation) {
-    const previous = discordianRouteLocks.get(key) ?? Promise.resolve();
-    const next = previous.catch(() => {
-      return;
-    }).then(operation);
-    discordianRouteLocks.set(key, next);
-    try {
-      await next;
-    } finally {
-      if (discordianRouteLocks.get(key) === next) {
-        discordianRouteLocks.delete(key);
-      }
-    }
+  function routingDirectory() {
+    return join4(process.env.HOME || ".", ".letta", "channels", CHANNEL_ID);
   }
   async function createDiscordianConversationRouteTarget(input) {
     const apiKey = resolveLettaApiKey(config);
@@ -848,10 +889,10 @@ function createDiscordAdapter(config) {
   async function ensureDiscordianChannelRoute(channelId) {
     if (!config.agentId)
       return;
-    const lockKey = `${config.accountId}:routes`;
-    await runDiscordianRouteLocked(lockKey, async () => {
-      const { routingPath, routes } = await getDiscordianRoutes();
-      const existingRoute = routes.find((route2) => route2.accountId === config.accountId && route2.chatId === channelId && (route2.threadId ?? null) === null && route2.enabled !== false);
+    await withRoutingStoreLock(routingDirectory(), async () => {
+      const store = await readRoutingStore(routingDirectory());
+      const { routes } = store.document;
+      const existingRoute = routes.find((route) => route.accountId === config.accountId && route.chatId === channelId && (route.threadId ?? null) === null && route.enabled !== false);
       if (existingRoute)
         return;
       let conversationId;
@@ -884,7 +925,7 @@ function createDiscordAdapter(config) {
         updatedAt: now
       };
       routes.push(route);
-      await saveDiscordianRoutes(routingPath, routes);
+      await writeRoutingStore(store);
       console.log("[Discordian] Created channel route", JSON.stringify({
         accountId: config.accountId,
         channelId,
@@ -896,10 +937,10 @@ function createDiscordAdapter(config) {
   async function ensureDiscordianDirectRoute(chatId) {
     if (!config.agentId)
       return;
-    const lockKey = `${config.accountId}:routes`;
-    await runDiscordianRouteLocked(lockKey, async () => {
-      const { routingPath, routes } = await getDiscordianRoutes();
-      const existingRoute = routes.find((route2) => route2.accountId === config.accountId && route2.chatId === chatId && (route2.threadId ?? null) === null && route2.enabled !== false);
+    await withRoutingStoreLock(routingDirectory(), async () => {
+      const store = await readRoutingStore(routingDirectory());
+      const { routes } = store.document;
+      const existingRoute = routes.find((route) => route.accountId === config.accountId && route.chatId === chatId && (route.threadId ?? null) === null && route.enabled !== false);
       if (existingRoute)
         return;
       let conversationId;
@@ -932,7 +973,7 @@ function createDiscordAdapter(config) {
         updatedAt: now
       };
       routes.push(route);
-      await saveDiscordianRoutes(routingPath, routes);
+      await writeRoutingStore(store);
       console.log("[Discordian] Created DM route", JSON.stringify({
         accountId: config.accountId,
         chatId,
@@ -944,18 +985,18 @@ function createDiscordAdapter(config) {
   async function ensureDiscordianThreadRoute(parentChannelId, threadId) {
     if (!config.agentId)
       return;
-    const lockKey = `${config.accountId}:routes`;
-    await runDiscordianRouteLocked(lockKey, async () => {
-      const { routingPath, routes } = await getDiscordianRoutes();
-      const existingExactRoute = routes.find((route2) => route2.accountId === config.accountId && route2.chatId === threadId && route2.threadId === threadId && route2.enabled !== false);
+    await withRoutingStoreLock(routingDirectory(), async () => {
+      const store = await readRoutingStore(routingDirectory());
+      const { routes } = store.document;
+      const existingExactRoute = routes.find((route) => route.accountId === config.accountId && route.chatId === threadId && route.threadId === threadId && route.enabled !== false);
       if (existingExactRoute)
         return;
-      const incompleteThreadRoute = routes.find((route2) => route2.accountId === config.accountId && route2.chatId === threadId && (route2.threadId ?? null) === null && route2.enabled !== false);
+      const incompleteThreadRoute = routes.find((route) => route.accountId === config.accountId && route.chatId === threadId && (route.threadId ?? null) === null && route.enabled !== false);
       if (incompleteThreadRoute) {
         incompleteThreadRoute.threadId = threadId;
         incompleteThreadRoute.chatType = incompleteThreadRoute.chatType ?? "channel";
         incompleteThreadRoute.updatedAt = new Date().toISOString();
-        await saveDiscordianRoutes(routingPath, routes);
+        await writeRoutingStore(store);
         console.log("[Discordian] Migrated thread route", JSON.stringify({ accountId: config.accountId, parentChannelId, threadId }));
         return;
       }
@@ -991,7 +1032,7 @@ function createDiscordAdapter(config) {
         updatedAt: now
       };
       routes.push(route);
-      await saveDiscordianRoutes(routingPath, routes);
+      await writeRoutingStore(store);
       console.log("[Discordian] Created thread route", JSON.stringify({
         accountId: config.accountId,
         parentChannelId,
@@ -1070,10 +1111,10 @@ function createDiscordAdapter(config) {
           if (markIngressMessageSeen(message.id))
             return;
           await ensureDiscordianDirectRoute(message.channelId);
-          const attachments2 = await collectAttachments(message.attachments, message.channelId);
-          if (!content && (!attachments2 || attachments2.length === 0))
+          const attachments = await collectAttachments(message.attachments, message.channelId);
+          if (!content && (!attachments || attachments.length === 0))
             return;
-          const inbound2 = {
+          const inbound = {
             channel: CHANNEL_ID,
             accountId: config.accountId,
             chatId: message.channelId,
@@ -1085,11 +1126,11 @@ function createDiscordAdapter(config) {
             threadId: null,
             chatType: "direct",
             isMention: false,
-            attachments: attachments2,
+            attachments,
             raw: message
           };
           try {
-            await adapter.onMessage(inbound2);
+            await adapter.onMessage(inbound);
           } catch (error) {
             console.error("[Discord] Error handling DM:", error);
             await notifyDiscordDeliveryError(message, error);
@@ -1333,13 +1374,13 @@ function createDiscordAdapter(config) {
           throw new Error("Discord reactions require a target message ID.");
         }
         const emoji = resolveDiscordReactionEmoji(msg.reaction);
-        const targetChannelId2 = msg.threadId ?? msg.chatId;
-        clearTypingForChat(targetChannelId2);
-        const channel2 = await client.channels.fetch(targetChannelId2);
-        if (!hasDiscordMessageFetcher(channel2)) {
-          throw new Error(`Discord channel not found or not text-based: ${targetChannelId2}`);
+        const targetChannelId = msg.threadId ?? msg.chatId;
+        clearTypingForChat(targetChannelId);
+        const channel = await client.channels.fetch(targetChannelId);
+        if (!hasDiscordMessageFetcher(channel)) {
+          throw new Error(`Discord channel not found or not text-based: ${targetChannelId}`);
         }
-        const message = await channel2.messages.fetch(targetMessageId);
+        const message = await channel.messages.fetch(targetMessageId);
         if (msg.removeReaction) {
           const resolved = message.reactions.resolve?.(emoji) ?? null;
           if (resolved && botUserId) {
@@ -1351,16 +1392,16 @@ function createDiscordAdapter(config) {
         return { messageId: targetMessageId };
       }
       if (msg.mediaPath) {
-        const targetChannelId2 = msg.threadId ?? msg.chatId;
-        const channel2 = await client.channels.fetch(targetChannelId2);
-        if (!isDiscordSendableChannel(channel2)) {
-          throw new Error(`Discord channel not found or not text-based: ${targetChannelId2}`);
+        const targetChannelId = msg.threadId ?? msg.chatId;
+        const channel = await client.channels.fetch(targetChannelId);
+        if (!isDiscordSendableChannel(channel)) {
+          throw new Error(`Discord channel not found or not text-based: ${targetChannelId}`);
         }
-        const reply2 = buildDiscordReplyOptions(msg.replyToMessageId, targetChannelId2);
-        clearTypingForChat(targetChannelId2);
-        const result = await channel2.send({
+        const reply = buildDiscordReplyOptions(msg.replyToMessageId, targetChannelId);
+        clearTypingForChat(targetChannelId);
+        const result = await channel.send({
           content: msg.text?.trim() || undefined,
-          ...reply2 ?? {},
+          ...reply ?? {},
           files: [
             {
               attachment: msg.mediaPath,
@@ -1588,6 +1629,6 @@ var channelPlugin = {
 };
 var plugin_default = channelPlugin;
 export {
-  plugin_default as default,
-  channelPlugin
+  channelPlugin,
+  plugin_default as default
 };

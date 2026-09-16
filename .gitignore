@@ -4,6 +4,9 @@
 # Custom channel runtime dependencies and generated routing state
 runtime/
 routing.yaml
+routing.json
+routing.json.*.tmp
+routing-backups/
 pairing.yaml
 accounts.json
 

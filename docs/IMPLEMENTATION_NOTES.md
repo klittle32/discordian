@@ -29,10 +29,12 @@ The native bundled Discord channel does this with runtime-internal helpers:
 Those helpers are methods/functions inside the Letta Code runtime, not stable exports in the custom-channel plugin contract. Discordian therefore does not import them. Instead, it mirrors their behavior with public/custom-channel surfaces:
 
 1. create a fresh Letta conversation via the public conversations API;
-2. write a Discordian route record into this channel's `routing.yaml`;
+2. write a Discordian route record into this channel's `routing.json`;
 3. forward the inbound message after the exact route exists.
 
-Routes are stored in the channel `routing.yaml` file using JSON content. Discordian performs read/modify/write updates through a process-local route lock and writes via temporary file + rename.
+Routing targets Letta Code >=0.32.11: `routing-store.ts` reads canonical `routing.json`, falling back to legacy `routing.yaml` (JSON content) only on ENOENT. Both absent means a fresh empty store; malformed documents, invalid known field types, and permission/IO errors propagate before conversation creation. Unknown top-level metadata and route fields remain intact. A legacy-only read is read-only; the next mutation writes JSON without deleting YAML. Existing JSON is never automatically merged with stale YAML, even when its routes array is empty.
+
+`readRoutingStore(directory)` returns `{ routingPath, document }`; `writeRoutingStore(store)` preserves the whole document and writes via an exclusive same-directory temporary file (0600), file sync, close, and atomic rename, cleaning temporary files on failure. `withRoutingStoreLock(directory, operation)` must wrap the entire read/modify/write cycle. Its module-level lock serializes all accounts and adapters sharing that store within one process. It does not coordinate external CLI writers or guarantee directory-entry durability across sudden power loss. Stop listeners before link/unlink or offline recovery; back up both formats first. Recovery must be explicit and must not silently replace established conversation mappings. No runtime version detection or automatic stale-file recovery is performed.
 
 Route creation requires a Letta API key available to the listener process because step 1 calls the public Letta API:
 
